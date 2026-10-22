@@ -40,24 +40,10 @@ func (h *AggregationHandler) Crawl(c *gin.Context) {
 		Platform:        req.Platform,
 		Type:            req.Type,
 		DateCutoffHours: req.DateCutoffHours,
+		Weights:         req.Weights,
 	}
 
-	// Update service weights dynamically if provided
-	svc := h.service
-	if req.Weights != nil {
-		// Create a shallow copy or a new service temporarily
-		// We could refactor service.AggregateListings to take weights as a param,
-		// but since the architecture passes it to NewAggregationService,
-		// we'll leave it as is or could inject at request scope.
-		// For simplicity, we just inject at request scope here.
-		svc = aggregation.NewAggregationService(
-			h.service.GetScrapers(),
-			h.service.GetCache(),
-			*req.Weights,
-		)
-	}
-
-	listings, err := svc.AggregateListings(c.Request.Context(), criteria)
+	listings, err := h.service.AggregateListings(c.Request.Context(), criteria)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, CrawlResponse{
 			Success: false,

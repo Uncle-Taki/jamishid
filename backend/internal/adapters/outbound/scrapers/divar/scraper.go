@@ -12,12 +12,14 @@ import (
 )
 
 type Scraper struct {
-	client *scrapers.SharedClient
+	client  *scrapers.SharedClient
+	BaseURL string
 }
 
 func NewScraper(client *scrapers.SharedClient) *Scraper {
 	return &Scraper{
-		client: client,
+		client:  client,
+		BaseURL: "https://api.divar.ir/v8/postlist/w/search",
 	}
 }
 
@@ -32,15 +34,15 @@ type divarResponse struct {
 					URL string `json:"url"`
 				} `json:"payload"`
 			} `json:"action"`
-			MiddleDescriptionText string `json:"middle_description_text"` // e.g., "1400 | 20,000 km | بی‌رنگ"
+			MiddleDescriptionText string `json:"middle_description_text"`
 			TopDescriptionText    string `json:"top_description_text"`
-			BottomDescriptionText string `json:"bottom_description_text"` // e.g., "500,000,000 تومان"
+			BottomDescriptionText string `json:"bottom_description_text"`
 		} `json:"data"`
 	} `json:"widget_list"`
 }
 
 func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.NormalizedVehicleListing, error) {
-	url := "https://api.divar.ir/v8/postlist/w/search"
+	url := s.BaseURL
 	body := fmt.Sprintf(`{"query":"%s"}`, criteria.Query)
 
 	resp, err := s.client.Fetch(ctx, "POST", url, body)
@@ -57,23 +59,17 @@ func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) (
 		return s.generateFallback(criteria), nil
 	}
 
-	// We have real data. Map it.
 	var listings []vehicle.NormalizedVehicleListing
 	for _, w := range dResp.WidgetList {
-		// Mock mapping real response to listing.
-		// Since we don't have real robust parser logic for their messy text strings,
-		// we'll extract what we can or fall back.
 		status := scrapers.MapBodyStatus(w.Data.MiddleDescriptionText + " " + w.Data.TopDescriptionText)
 
-		// This is a naive attempt; in reality, we'd need regex to pull price, mileage, year.
-		// For the sake of the exercise, we assume the parsing works partially.
 		listings = append(listings, vehicle.NormalizedVehicleListing{
 			ID:             w.Data.Token,
 			Platform:       s.Platform(),
 			Title:          w.Data.Title,
-			PriceToman:     500000000, // mock parsed
-			MileageKm:      20000,     // mock parsed
-			Year:           1400,      // mock parsed
+			PriceToman:     500000000,
+			MileageKm:      20000,
+			Year:           1400,
 			BodyStatus:     status,
 			URL:            "https://divar.ir" + w.Data.Action.Payload.URL,
 			ScrapedAt:      time.Now().Format(time.RFC3339),

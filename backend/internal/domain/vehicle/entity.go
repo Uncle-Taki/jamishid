@@ -60,15 +60,22 @@ type ScoreWeights struct {
 }
 
 type ListingScoreBreakdown struct {
-	PriceScore     float64 `json:"priceScore"`
-	MileageScore   float64 `json:"mileageScore"`
-	YearScore      float64 `json:"yearScore"`
-	ConditionScore float64 `json:"conditionScore"`
-	TotalScore     float64 `json:"totalScore"`
+	PriceScore        float64  `json:"priceScore"`
+	ConditionScore    float64  `json:"conditionScore"`
+	MileageScore      float64  `json:"mileageScore"`
+	YearScore         float64  `json:"yearScore"`
+	TotalScore        float64  `json:"totalScore"`
+	DealTier          DealTier `json:"dealTier"`
+	DealLabelFa       string   `json:"dealLabelFa"`
+	DealLabelEn       string   `json:"dealLabelEn"`
+	BadgeBg           string   `json:"badgeBg"`
+	BadgeText         string   `json:"badgeText"`
+	BadgeBorder       string   `json:"badgeBorder"`
+	MedianPriceToman  float64  `json:"medianPriceToman"`
+	PriceDeltaPercent float64  `json:"priceDeltaPercent"`
 }
 
 type ScoredListing struct {
 	NormalizedVehicleListing
-	Score    ListingScoreBreakdown `json:"score"`
-	DealTier DealTier              `json:"dealTier"`
+	Score ListingScoreBreakdown `json:"score"`
 }

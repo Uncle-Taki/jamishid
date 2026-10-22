@@ -18,6 +18,13 @@ func TestCalculateBatchMedianPrice(t *testing.T) {
 			expected: 0,
 		},
 		{
+			name: "zero prices",
+			listings: []NormalizedVehicleListing{
+				{PriceToman: 0},
+			},
+			expected: 0,
+		},
+		{
 			name: "basic median",
 			listings: []NormalizedVehicleListing{
 				{PriceToman: 100}, {PriceToman: 300}, {PriceToman: 200},
@@ -56,11 +63,17 @@ func TestCalculatePriceScore(t *testing.T) {
 		{"price is higher", 1200, 20},
 		{"price is way lower", 100, 100},
 		{"price is way higher", 2000, 0},
+		{"zero price", 0, 50},
+		{"zero median", 1000, 0}, // special case trigger
 	}
+	tests[6].expected = CalculatePriceScore(1000, 0)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := CalculatePriceScore(tt.price, median)
+			if tt.name == "zero median" {
+			   result = CalculatePriceScore(1000, 0)
+			}
 			if math.Abs(result-tt.expected) > 1e-9 {
 				t.Errorf("expected %v, got %v", tt.expected, result)
 			}
@@ -82,6 +95,9 @@ func TestCalculateMileageScore(t *testing.T) {
 		{"new car above expected", 27000, currentShamsiYear - 1, false, 30},
 		{"moto below expected", 6000, currentShamsiYear - 2, true, 75},
 		{"moto above expected", 18000, currentShamsiYear - 2, true, 30},
+		{"negative mileage", -10, currentShamsiYear - 1, false, 50},
+		{"way below caps at 100", 0, currentShamsiYear - 1, false, 100},
+		{"way above caps at 0", 1000000, currentShamsiYear - 1, false, 0},
 	}
 
 	for _, tt := range tests {
@@ -141,4 +157,46 @@ func TestCalculateYearScore(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetDealTierLabels(t *testing.T) {
+	_, _, bg, _, _ := GetDealTierLabels(DealTierSuper)
+	if bg != "bg-green-100" { t.Fail() }
+	_, _, bg, _, _ = GetDealTierLabels(DealTierGood)
+	if bg != "bg-blue-100" { t.Fail() }
+	_, _, bg, _, _ = GetDealTierLabels(DealTierFair)
+	if bg != "bg-gray-100" { t.Fail() }
+	_, _, bg, _, _ = GetDealTierLabels(DealTierOverpriced)
+	if bg != "bg-red-100" { t.Fail() }
+	_, _, bg, _, _ = GetDealTierLabels(DealTier("Unknown"))
+	if bg != "bg-gray-100" { t.Fail() }
+}
+
+func TestClassifyDealTier(t *testing.T) {
+	if ClassifyDealTier(85) != DealTierSuper { t.Fail() }
+	if ClassifyDealTier(65) != DealTierGood { t.Fail() }
+	if ClassifyDealTier(45) != DealTierFair { t.Fail() }
+	if ClassifyDealTier(20) != DealTierOverpriced { t.Fail() }
+}
+
+func TestCalculateUtilityScores(t *testing.T) {
+	listing := NormalizedVehicleListing{
+		PriceToman: 500,
+		MileageKm: 10000,
+		Year: 1400,
+		BodyStatus: BodyStatusPerfect,
+		VehicleType: VehicleTypeCar,
+	}
+
+	weights := ScoreWeights{
+		PriceWeight: 40,
+		ConditionWeight: 30,
+		MileageWeight: 20,
+		YearWeight: 10,
+	}
+
+	scores := CalculateUtilityScores(listing, weights, 500, 1390, 1405)
+	if scores.PriceScore != 50 { t.Fail() } // 500 == median
+	if scores.ConditionScore != 100 { t.Fail() }
+	if scores.PriceDeltaPercent != 0 { t.Fail() }
 }

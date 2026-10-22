@@ -105,15 +105,19 @@ func (s *AggregationService) AggregateListings(ctx context.Context, criteria veh
 		}
 	}
 
+	// Use dynamic weights if provided, else fallback to service default
+	activeWeights := s.weights
+	if criteria.Weights != nil {
+		activeWeights = *criteria.Weights
+	}
+
 	var scoredListings []vehicle.ScoredListing
 	for _, listing := range filteredListings {
-		scores := vehicle.CalculateUtilityScores(listing, s.weights, marketMedian, minYear, maxYear)
-		tier := vehicle.ClassifyDealTier(scores.TotalScore)
+		scores := vehicle.CalculateUtilityScores(listing, activeWeights, marketMedian, minYear, maxYear)
 
 		scoredListings = append(scoredListings, vehicle.ScoredListing{
 			NormalizedVehicleListing: listing,
 			Score:                    scores,
-			DealTier:                 tier,
 		})
 	}
 
