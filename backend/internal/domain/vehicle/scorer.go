@@ -73,14 +73,21 @@ func CalculatePriceScore(price, median float64) float64 {
 	return score
 }
 
+// CurrentShamsiYear accurately calculates the current Iranian/Shamsi calendar year based on Nowruz logic
+func CurrentShamsiYear(now time.Time) int {
+	if now.Month() < time.March || (now.Month() == time.March && now.Day() < 21) {
+		return now.Year() - 622
+	}
+	return now.Year() - 621
+}
+
 // CalculateMileageScore computes score based on mileage and Shamsi year
 func CalculateMileageScore(mileage float64, year int, isMotorcycle bool) float64 {
 	if mileage < 0 {
 		return 50
 	}
 
-	// Dynamically compute current Shamsi year
-	currentShamsiYear := time.Now().Year() - 621
+	currentShamsiYear := CurrentShamsiYear(time.Now())
 
 	ageYears := currentShamsiYear - year
 	if ageYears < 1 {

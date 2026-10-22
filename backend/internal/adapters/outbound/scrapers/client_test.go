@@ -36,6 +36,13 @@ func TestMapBodyStatus(t *testing.T) {
 
 func TestSharedClientFetch_Success(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") != "application/json, text/plain, */*" {
+			t.Errorf("missing or incorrect Accept header: %s", r.Header.Get("Accept"))
+		}
+		if r.Header.Get("Accept-Language") != "fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7" {
+			t.Errorf("missing or incorrect Accept-Language header: %s", r.Header.Get("Accept-Language"))
+		}
+
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"success": true}`))
 	}))

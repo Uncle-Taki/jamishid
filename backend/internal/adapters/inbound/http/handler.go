@@ -1,7 +1,9 @@
 package http
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
@@ -28,6 +30,11 @@ func (h *AggregationHandler) Crawl(c *gin.Context) {
 		return
 	}
 
+	reqType := req.Type
+	if reqType == "" {
+		reqType = vehicle.VehicleTypeCar
+	}
+
 	criteria := vehicle.SearchCriteria{
 		Query:           req.Query,
 		MinPrice:        req.MinPrice,
@@ -38,12 +45,15 @@ func (h *AggregationHandler) Crawl(c *gin.Context) {
 		MaxMileage:      req.MaxMileage,
 		CitySlug:        req.CitySlug,
 		Platform:        req.Platform,
-		Type:            req.Type,
+		Type:            reqType,
 		DateCutoffHours: req.DateCutoffHours,
 		Weights:         req.Weights,
 	}
 
-	listings, err := h.service.AggregateListings(c.Request.Context(), criteria)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+
+	listings, err := h.service.AggregateListings(ctx, criteria)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, CrawlResponse{
 			Success: false,

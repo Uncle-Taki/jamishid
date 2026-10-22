@@ -113,32 +113,63 @@ func TestAggregationService_AggregateListings(t *testing.T) {
 	}
 }
 
-func TestAggregationService_DateCutoff(t *testing.T) {
+func TestAggregationService_FilteringAndDedup(t *testing.T) {
 	cache := &mockCache{}
 	weights := vehicle.ScoreWeights{PriceWeight: 100}
 
 	nowStr := time.Now().Format(time.RFC3339)
 	oldStr := time.Now().Add(-10 * time.Hour).Format(time.RFC3339)
 
-	scraper := &mockScraper{
+	scraper1 := &mockScraper{
 		platform: vehicle.PlatformDivar,
 		result: []vehicle.NormalizedVehicleListing{
-			{ID: "1", ScrapedAt: nowStr},
-			{ID: "2", ScrapedAt: oldStr},
+			{ID: "1", URL: "/a", ScrapedAt: nowStr, PriceToman: 100, Year: 1400, MileageKm: 10000, Platform: vehicle.PlatformDivar},
+			{ID: "1", URL: "/a", ScrapedAt: nowStr, PriceToman: 100, Year: 1400, MileageKm: 10000, Platform: vehicle.PlatformDivar}, // Duplicate
+			{ID: "2", URL: "/b", ScrapedAt: oldStr, PriceToman: 200, Year: 1390, MileageKm: 50000, Platform: vehicle.PlatformDivar}, // Excluded by date
+			{ID: "3", URL: "/c", ScrapedAt: nowStr, PriceToman: 50, Year: 1395, MileageKm: 30000, Platform: vehicle.PlatformDivar},  // Excluded by min price
+			{ID: "4", URL: "/d", ScrapedAt: nowStr, PriceToman: 500, Year: 1402, MileageKm: 5000, Platform: vehicle.PlatformDivar},  // Excluded by max price
+			{ID: "5", URL: "/e", ScrapedAt: nowStr, PriceToman: 150, Year: 1380, MileageKm: 200000, Platform: vehicle.PlatformDivar}, // Excluded by min year
 		},
 	}
 
-	svc := NewAggregationService([]ports.MarketplaceScraper{scraper}, cache, weights)
+	scraper2 := &mockScraper{
+		platform: vehicle.PlatformBama,
+		result: []vehicle.NormalizedVehicleListing{
+			{ID: "6", URL: "/f", ScrapedAt: nowStr, PriceToman: 120, Year: 1398, MileageKm: 40000, Platform: vehicle.PlatformBama}, // Excluded by platform filter
+		},
+	}
+
+	svc := NewAggregationService([]ports.MarketplaceScraper{scraper1, scraper2}, cache, weights)
 
 	hours := 5
-	criteria := vehicle.SearchCriteria{DateCutoffHours: &hours}
+	minPrice := 80.0
+	maxPrice := 300.0
+	minYear := 1385
+	maxYear := 1401
+	minMileage := 5000.0
+	maxMileage := 80000.0
+	platformFilter := vehicle.PlatformDivar
 
-	results, _ := svc.AggregateListings(context.Background(), criteria)
+	criteria := vehicle.SearchCriteria{
+		DateCutoffHours: &hours,
+		MinPrice:        &minPrice,
+		MaxPrice:        &maxPrice,
+		MinYear:         &minYear,
+		MaxYear:         &maxYear,
+		MinMileage:      &minMileage,
+		MaxMileage:      &maxMileage,
+		Platform:        &platformFilter,
+	}
+
+	results, err := svc.AggregateListings(context.Background(), criteria)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if len(results) != 1 {
-		t.Errorf("expected 1 result, got %d", len(results))
+		t.Fatalf("expected 1 result, got %d", len(results))
 	}
 	if results[0].ID != "1" {
-		t.Errorf("expected result ID 1")
+		t.Errorf("expected result ID 1 to pass all filters and dedup")
 	}
 }

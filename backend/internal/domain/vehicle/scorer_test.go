@@ -81,8 +81,25 @@ func TestCalculatePriceScore(t *testing.T) {
 	}
 }
 
+func TestCurrentShamsiYear(t *testing.T) {
+	preNowruz := time.Date(2024, time.February, 15, 0, 0, 0, 0, time.UTC)
+	if CurrentShamsiYear(preNowruz) != 1402 {
+		t.Errorf("expected pre-Nowruz year 1402, got %d", CurrentShamsiYear(preNowruz))
+	}
+
+	exactlyNowruz := time.Date(2024, time.March, 21, 0, 0, 0, 0, time.UTC)
+	if CurrentShamsiYear(exactlyNowruz) != 1403 {
+		t.Errorf("expected exactly-Nowruz year 1403, got %d", CurrentShamsiYear(exactlyNowruz))
+	}
+
+	postNowruz := time.Date(2024, time.October, 21, 0, 0, 0, 0, time.UTC)
+	if CurrentShamsiYear(postNowruz) != 1403 {
+		t.Errorf("expected post-Nowruz year 1403, got %d", CurrentShamsiYear(postNowruz))
+	}
+}
+
 func TestCalculateMileageScore(t *testing.T) {
-	currentShamsiYear := time.Now().Year() - 621
+	currentShamsiYear := CurrentShamsiYear(time.Now())
 
 	tests := []struct {
 		name         string

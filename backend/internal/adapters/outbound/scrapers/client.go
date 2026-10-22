@@ -18,9 +18,17 @@ type SharedClient struct {
 }
 
 func NewSharedClient() *SharedClient {
+	transport := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConns:        50,
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: 5 * time.Second,
+	}
+
 	return &SharedClient{
 		client: &http.Client{
-			Timeout: 10 * time.Second,
+			Transport: transport,
+			Timeout:   10 * time.Second,
 		},
 	}
 }
@@ -33,6 +41,8 @@ func (s *SharedClient) Fetch(ctx context.Context, method, url, body string) ([]b
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7")
 
 	resp, err := s.client.Do(req)
 	if err != nil {

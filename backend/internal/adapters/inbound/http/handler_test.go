@@ -15,11 +15,13 @@ import (
 )
 
 type mockAggregationService struct {
-	listings []vehicle.ScoredListing
-	err      error
+	listings     []vehicle.ScoredListing
+	err          error
+	lastCriteria vehicle.SearchCriteria
 }
 
 func (m *mockAggregationService) AggregateListings(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.ScoredListing, error) {
+	m.lastCriteria = criteria
 	return m.listings, m.err
 }
 
@@ -114,6 +116,9 @@ func TestCrawl_IntegrationSuccess(t *testing.T) {
 	}
 	if resp.Data[0].ID != "1" {
 		t.Errorf("expected listing ID 1")
+	}
+	if svc.lastCriteria.Type != vehicle.VehicleTypeCar {
+		t.Errorf("expected default Type to be 'car', got %s", svc.lastCriteria.Type)
 	}
 }
 

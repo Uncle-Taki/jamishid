@@ -9,6 +9,8 @@ services:
     environment:
       - PORT=8080
       - GIN_MODE=release
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
 
   frontend:
     build:

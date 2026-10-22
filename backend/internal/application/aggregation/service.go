@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,18 +75,57 @@ func (s *AggregationService) AggregateListings(ctx context.Context, criteria veh
 
 	wg.Wait()
 
-	// Apply date cutoff
+	// Deduplicate by ID
+	seen := make(map[string]bool)
+	var dedupedListings []vehicle.NormalizedVehicleListing
+	for _, l := range allListings {
+		key := l.ID
+		if l.URL != "" {
+			key += "|" + l.URL
+		}
+		if !seen[key] {
+			seen[key] = true
+			dedupedListings = append(dedupedListings, l)
+		}
+	}
+
+	// Apply filtering
 	var filteredListings []vehicle.NormalizedVehicleListing
+	var cutoffTime time.Time
 	if criteria.DateCutoffHours != nil {
-		cutoffTime := time.Now().Add(-time.Duration(*criteria.DateCutoffHours) * time.Hour)
-		for _, l := range allListings {
+		cutoffTime = time.Now().Add(-time.Duration(*criteria.DateCutoffHours) * time.Hour)
+	}
+
+	for _, l := range dedupedListings {
+		if criteria.DateCutoffHours != nil {
 			t, err := time.Parse(time.RFC3339, l.ScrapedAt)
-			if err == nil && t.After(cutoffTime) {
-				filteredListings = append(filteredListings, l)
+			if err == nil && t.Before(cutoffTime) {
+				continue
 			}
 		}
-	} else {
-		filteredListings = allListings
+		if criteria.MinPrice != nil && l.PriceToman < *criteria.MinPrice {
+			continue
+		}
+		if criteria.MaxPrice != nil && l.PriceToman > *criteria.MaxPrice {
+			continue
+		}
+		if criteria.MinYear != nil && l.Year < *criteria.MinYear {
+			continue
+		}
+		if criteria.MaxYear != nil && l.Year > *criteria.MaxYear {
+			continue
+		}
+		if criteria.MinMileage != nil && l.MileageKm < *criteria.MinMileage {
+			continue
+		}
+		if criteria.MaxMileage != nil && l.MileageKm > *criteria.MaxMileage {
+			continue
+		}
+		if criteria.Platform != nil && l.Platform != *criteria.Platform {
+			continue
+		}
+
+		filteredListings = append(filteredListings, l)
 	}
 
 	if len(filteredListings) == 0 {
@@ -131,6 +171,7 @@ func (s *AggregationService) AggregateListings(ctx context.Context, criteria veh
 }
 
 func generateCacheKey(criteria vehicle.SearchCriteria) string {
+	criteria.Query = strings.TrimSpace(criteria.Query)
 	b, _ := json.Marshal(criteria)
 	hash := sha256.Sum256(b)
 	return hex.EncodeToString(hash[:])
