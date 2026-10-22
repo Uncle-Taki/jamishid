@@ -12,12 +12,14 @@ import (
 )
 
 type Scraper struct {
-	client *scrapers.SharedClient
+	client  *scrapers.SharedClient
+	BaseURL string
 }
 
 func NewScraper(client *scrapers.SharedClient) *Scraper {
 	return &Scraper{
-		client: client,
+		client:  client,
+		BaseURL: "https://www.sheypoor.com/api/search",
 	}
 }
 
@@ -37,7 +39,7 @@ type sheypoorResponse struct {
 }
 
 func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.NormalizedVehicleListing, error) {
-	url := fmt.Sprintf("https://www.sheypoor.com/api/search?q=%s", criteria.Query)
+	url := fmt.Sprintf("%s?q=%s", s.BaseURL, criteria.Query)
 
 	resp, err := s.client.Fetch(ctx, "GET", url, "")
 	if err != nil {

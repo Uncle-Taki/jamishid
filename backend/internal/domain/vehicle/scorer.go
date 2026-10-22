@@ -144,6 +144,35 @@ func CalculateYearScore(year, minYear, maxYear int) float64 {
 	return (float64(year-minYear) / float64(maxYear-minYear)) * 100
 }
 
+// GetDealTierLabels returns localized labels and UI badge classes for a given tier
+func GetDealTierLabels(tier DealTier) (labelFa, labelEn, bg, text, border string) {
+	switch tier {
+	case DealTierSuper:
+		return "عالی", "Super Deal", "bg-green-100", "text-green-800", "border-green-200"
+	case DealTierGood:
+		return "خوب", "Good Deal", "bg-blue-100", "text-blue-800", "border-blue-200"
+	case DealTierFair:
+		return "منصفانه", "Fair Market", "bg-gray-100", "text-gray-800", "border-gray-200"
+	case DealTierOverpriced:
+		return "گران", "Overpriced", "bg-red-100", "text-red-800", "border-red-200"
+	default:
+		return "نامشخص", "Unknown", "bg-gray-100", "text-gray-800", "border-gray-200"
+	}
+}
+
+// ClassifyDealTier determines the deal tier based on exact constants
+func ClassifyDealTier(totalScore float64) DealTier {
+	if totalScore >= 80 {
+		return DealTierSuper
+	} else if totalScore >= 60 {
+		return DealTierGood
+	} else if totalScore >= 40 {
+		return DealTierFair
+	} else {
+		return DealTierOverpriced
+	}
+}
+
 // CalculateUtilityScores calculates all scores and the weighted total
 func CalculateUtilityScores(listing NormalizedVehicleListing, weights ScoreWeights, marketMedian float64, minYear, maxYear int) ListingScoreBreakdown {
 	priceScore := CalculatePriceScore(listing.PriceToman, marketMedian)
@@ -162,24 +191,27 @@ func CalculateUtilityScores(listing NormalizedVehicleListing, weights ScoreWeigh
 		totalScore = totalScore / sumWeights
 	}
 
-	return ListingScoreBreakdown{
-		PriceScore:     math.Round(priceScore*100) / 100,
-		MileageScore:   math.Round(mileageScore*100) / 100,
-		YearScore:      math.Round(yearScore*100) / 100,
-		ConditionScore: math.Round(conditionScore*100) / 100,
-		TotalScore:     math.Round(totalScore*100) / 100,
-	}
-}
+	tier := ClassifyDealTier(totalScore)
+	labelFa, labelEn, bg, text, border := GetDealTierLabels(tier)
 
-// ClassifyDealTier determines the deal tier based on exact constants
-func ClassifyDealTier(totalScore float64) DealTier {
-	if totalScore >= 80 {
-		return DealTierSuper
-	} else if totalScore >= 60 {
-		return DealTierGood
-	} else if totalScore >= 40 {
-		return DealTierFair
-	} else {
-		return DealTierOverpriced
+	var priceDelta float64
+	if marketMedian > 0 {
+		priceDelta = ((listing.PriceToman - marketMedian) / marketMedian) * 100.0
+	}
+
+	return ListingScoreBreakdown{
+		PriceScore:        math.Round(priceScore*100) / 100,
+		MileageScore:      math.Round(mileageScore*100) / 100,
+		YearScore:         math.Round(yearScore*100) / 100,
+		ConditionScore:    math.Round(conditionScore*100) / 100,
+		TotalScore:        math.Round(totalScore*100) / 100,
+		DealTier:          tier,
+		DealLabelFa:       labelFa,
+		DealLabelEn:       labelEn,
+		BadgeBg:           bg,
+		BadgeText:         text,
+		BadgeBorder:       border,
+		MedianPriceToman:  marketMedian,
+		PriceDeltaPercent: math.Round(priceDelta*100) / 100,
 	}
 }

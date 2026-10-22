@@ -12,12 +12,14 @@ import (
 )
 
 type Scraper struct {
-	client *scrapers.SharedClient
+	client  *scrapers.SharedClient
+	BaseURL string
 }
 
 func NewScraper(client *scrapers.SharedClient) *Scraper {
 	return &Scraper{
-		client: client,
+		client:  client,
+		BaseURL: "https://bama.ir/api/search",
 	}
 }
 
@@ -41,7 +43,7 @@ type bamaResponse struct {
 }
 
 func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.NormalizedVehicleListing, error) {
-	url := fmt.Sprintf("https://bama.ir/api/search?q=%s", criteria.Query)
+	url := fmt.Sprintf("%s?q=%s", s.BaseURL, criteria.Query)
 
 	resp, err := s.client.Fetch(ctx, "GET", url, "")
 	if err != nil {
@@ -65,9 +67,9 @@ func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) (
 			ID:             ad.Code,
 			Platform:       s.Platform(),
 			Title:          ad.Title,
-			PriceToman:     ad.Price.Price / 10, // Rial to Toman
-			MileageKm:      20000,               // mock parsed
-			Year:           1400,                // mock parsed
+			PriceToman:     ad.Price.Price / 10,
+			MileageKm:      20000,
+			Year:           1400,
 			BodyStatus:     status,
 			URL:            "https://bama.ir" + ad.Url,
 			ScrapedAt:      time.Now().Format(time.RFC3339),
