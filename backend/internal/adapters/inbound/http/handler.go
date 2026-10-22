@@ -3,16 +3,16 @@ package http
 import (
 	"net/http"
 
-	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/application/aggregation"
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"github.com/gin-gonic/gin"
 )
 
 type AggregationHandler struct {
-	service *aggregation.AggregationService
+	service ports.AggregationUseCase
 }
 
-func NewAggregationHandler(service *aggregation.AggregationService) *AggregationHandler {
+func NewAggregationHandler(service ports.AggregationUseCase) *AggregationHandler {
 	return &AggregationHandler{
 		service: service,
 	}

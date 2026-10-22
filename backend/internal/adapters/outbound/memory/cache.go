@@ -28,14 +28,17 @@ func NewCache(ttl time.Duration) *Cache {
 
 func (c *Cache) Get(ctx context.Context, key string) ([]vehicle.ScoredListing, bool) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	item, found := c.items[key]
+	c.mu.RUnlock()
+
 	if !found {
 		return nil, false
 	}
 
 	if time.Now().After(item.expiresAt) {
+		c.mu.Lock()
+		delete(c.items, key)
+		c.mu.Unlock()
 		return nil, false
 	}
 
@@ -52,4 +55,16 @@ func (c *Cache) Set(ctx context.Context, key string, listings []vehicle.ScoredLi
 	}
 
 	return nil
+}
+
+func (c *Cache) Cleanup() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for key, item := range c.items {
+		if now.After(item.expiresAt) {
+			delete(c.items, key)
+		}
+	}
 }

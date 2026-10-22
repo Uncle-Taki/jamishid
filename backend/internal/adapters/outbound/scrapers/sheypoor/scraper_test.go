@@ -25,6 +25,14 @@ func TestScraper_HappyPath(t *testing.T) {
 					{
 						"key": "وضعیت بدنه",
 						"value": "تمام رنگ"
+					},
+					{
+						"key": "سال ساخت",
+						"value": "1395"
+					},
+					{
+						"key": "کارکرد",
+						"value": "120,000"
 					}
 				]
 			}
@@ -62,6 +70,12 @@ func TestScraper_HappyPath(t *testing.T) {
 	if listings[0].BodyStatus != vehicle.BodyStatusFullPaint {
 		t.Errorf("expected BodyStatusFullPaint, got %s", listings[0].BodyStatus)
 	}
+	if listings[0].Year != 1395 {
+		t.Errorf("expected Year 1395, got %d", listings[0].Year)
+	}
+	if listings[0].MileageKm != 120000 {
+		t.Errorf("expected MileageKm 120000, got %f", listings[0].MileageKm)
+	}
 }
 
 func TestScraper_Fallback(t *testing.T) {
@@ -74,7 +88,7 @@ func TestScraper_Fallback(t *testing.T) {
 	scraper := NewScraper(client)
 	scraper.BaseURL = ts.URL
 
-	criteria := vehicle.SearchCriteria{Query: "pride"}
+	criteria := vehicle.SearchCriteria{Query: "pride", Type: vehicle.VehicleTypeMotorcycle}
 	listings, err := scraper.Scrape(context.Background(), criteria)
 
 	if err != nil {
@@ -129,5 +143,22 @@ func TestScraper_EmptyDataFallback(t *testing.T) {
 
 	if len(listings) != 5 {
 		t.Fatalf("expected 5 fallback listings due to empty items list, got %d", len(listings))
+	}
+}
+
+func TestScraper_FetchErrorFallback(t *testing.T) {
+	client := scrapers.NewSharedClient()
+	scraper := NewScraper(client)
+	scraper.BaseURL = "http://invalid-url-that-will-fail.local"
+
+	criteria := vehicle.SearchCriteria{Query: "pride"}
+	listings, err := scraper.Scrape(context.Background(), criteria)
+
+	if err != nil {
+		t.Fatalf("expected no error from fallback, got %v", err)
+	}
+
+	if len(listings) != 5 {
+		t.Fatalf("expected 5 fallback listings, got %d", len(listings))
 	}
 }

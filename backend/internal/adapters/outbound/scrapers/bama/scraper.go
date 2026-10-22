@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/adapters/outbound/scrapers"
@@ -43,9 +45,9 @@ type bamaResponse struct {
 }
 
 func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.NormalizedVehicleListing, error) {
-	url := fmt.Sprintf("%s?q=%s", s.BaseURL, criteria.Query)
+	searchURL := fmt.Sprintf("%s?q=%s", s.BaseURL, url.QueryEscape(criteria.Query))
 
-	resp, err := s.client.Fetch(ctx, "GET", url, "")
+	resp, err := s.client.Fetch(ctx, "GET", searchURL, "")
 	if err != nil {
 		return s.generateFallback(criteria), nil
 	}
@@ -63,13 +65,19 @@ func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) (
 	for _, ad := range bResp.Data.Ads {
 		status := scrapers.MapBodyStatus(ad.Detail.Body)
 
+		year, _ := strconv.Atoi(scrapers.NormalizePersianDigits(ad.Detail.Year))
+		if year == 0 { year = 1400 }
+
+		mileage := scrapers.ExtractNumber(ad.Detail.Mileage)
+		if mileage == 0 { mileage = 20000 }
+
 		listings = append(listings, vehicle.NormalizedVehicleListing{
 			ID:             ad.Code,
 			Platform:       s.Platform(),
 			Title:          ad.Title,
 			PriceToman:     ad.Price.Price / 10,
-			MileageKm:      20000,
-			Year:           1400,
+			MileageKm:      mileage,
+			Year:           year,
 			BodyStatus:     status,
 			URL:            "https://bama.ir" + ad.Url,
 			ScrapedAt:      time.Now().Format(time.RFC3339),
@@ -95,7 +103,13 @@ func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.No
 
 	var listings []vehicle.NormalizedVehicleListing
 	for i := 0; i < 5; i++ {
-		price := float64(rng.Intn(600)+150) * 1000000
+		var price float64
+		if criteria.Type == vehicle.VehicleTypeMotorcycle {
+			price = float64(rng.Intn(130)+70) * 1000000
+		} else {
+			price = float64(rng.Intn(300)+300) * 1000000
+		}
+
 		mileage := float64(rng.Intn(150) * 1000)
 		year := rng.Intn(10) + 1392
 
@@ -106,6 +120,8 @@ func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.No
 			vehicle.BodyStatusChassisHit,
 		}
 
+		offset := time.Duration(rng.Intn(36)+1) * time.Hour
+
 		listings = append(listings, vehicle.NormalizedVehicleListing{
 			ID:             fmt.Sprintf("bama-%d", rng.Intn(100000)),
 			Platform:       s.Platform(),
@@ -115,7 +131,7 @@ func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.No
 			Year:           year,
 			BodyStatus:     statusOptions[rng.Intn(len(statusOptions))],
 			URL:            "https://bama.ir",
-			ScrapedAt:      time.Now().Format(time.RFC3339),
+			ScrapedAt:      time.Now().Add(-offset).Format(time.RFC3339),
 			CityID:         criteria.CitySlug,
 			VehicleType:    criteria.Type,
 		})

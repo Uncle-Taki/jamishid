@@ -161,21 +161,21 @@ func TestCalculateYearScore(t *testing.T) {
 
 func TestGetDealTierLabels(t *testing.T) {
 	_, _, bg, _, _ := GetDealTierLabels(DealTierSuper)
-	if bg != "bg-green-100" { t.Fail() }
+	if bg != "bg-emerald-500/20" { t.Fail() }
 	_, _, bg, _, _ = GetDealTierLabels(DealTierGood)
-	if bg != "bg-blue-100" { t.Fail() }
+	if bg != "bg-blue-500/20" { t.Fail() }
 	_, _, bg, _, _ = GetDealTierLabels(DealTierFair)
-	if bg != "bg-gray-100" { t.Fail() }
+	if bg != "bg-slate-800" { t.Fail() }
 	_, _, bg, _, _ = GetDealTierLabels(DealTierOverpriced)
-	if bg != "bg-red-100" { t.Fail() }
+	if bg != "bg-rose-500/20" { t.Fail() }
 	_, _, bg, _, _ = GetDealTierLabels(DealTier("Unknown"))
 	if bg != "bg-gray-100" { t.Fail() }
 }
 
 func TestClassifyDealTier(t *testing.T) {
-	if ClassifyDealTier(85) != DealTierSuper { t.Fail() }
-	if ClassifyDealTier(65) != DealTierGood { t.Fail() }
-	if ClassifyDealTier(45) != DealTierFair { t.Fail() }
+	if ClassifyDealTier(86) != DealTierSuper { t.Fail() }
+	if ClassifyDealTier(75) != DealTierGood { t.Fail() }
+	if ClassifyDealTier(55) != DealTierFair { t.Fail() }
 	if ClassifyDealTier(20) != DealTierOverpriced { t.Fail() }
 }
 

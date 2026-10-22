@@ -148,13 +148,13 @@ func CalculateYearScore(year, minYear, maxYear int) float64 {
 func GetDealTierLabels(tier DealTier) (labelFa, labelEn, bg, text, border string) {
 	switch tier {
 	case DealTierSuper:
-		return "عالی", "Super Deal", "bg-green-100", "text-green-800", "border-green-200"
+		return "فرصت طلایی خرید", "Super Deal 🏆", "bg-emerald-500/20", "text-emerald-300", "border-emerald-500/40"
 	case DealTierGood:
-		return "خوب", "Good Deal", "bg-blue-100", "text-blue-800", "border-blue-200"
+		return "ارزش خرید بالا", "Good Deal ✨", "bg-blue-500/20", "text-blue-300", "border-blue-500/40"
 	case DealTierFair:
-		return "منصفانه", "Fair Market", "bg-gray-100", "text-gray-800", "border-gray-200"
+		return "قیمت منصفانه بازار", "Fair Market ⚖️", "bg-slate-800", "text-slate-300", "border-slate-700"
 	case DealTierOverpriced:
-		return "گران", "Overpriced", "bg-red-100", "text-red-800", "border-red-200"
+		return "ارزش خرید پایین / گران", "Overpriced / Risky ⚠️", "bg-rose-500/20", "text-rose-400", "border-rose-500/40"
 	default:
 		return "نامشخص", "Unknown", "bg-gray-100", "text-gray-800", "border-gray-200"
 	}
@@ -162,11 +162,11 @@ func GetDealTierLabels(tier DealTier) (labelFa, labelEn, bg, text, border string
 
 // ClassifyDealTier determines the deal tier based on exact constants
 func ClassifyDealTier(totalScore float64) DealTier {
-	if totalScore >= 80 {
+	if totalScore >= 85 {
 		return DealTierSuper
-	} else if totalScore >= 60 {
+	} else if totalScore >= 70 {
 		return DealTierGood
-	} else if totalScore >= 40 {
+	} else if totalScore >= 50 {
 		return DealTierFair
 	} else {
 		return DealTierOverpriced
@@ -200,11 +200,11 @@ func CalculateUtilityScores(listing NormalizedVehicleListing, weights ScoreWeigh
 	}
 
 	return ListingScoreBreakdown{
-		PriceScore:        math.Round(priceScore*100) / 100,
-		MileageScore:      math.Round(mileageScore*100) / 100,
-		YearScore:         math.Round(yearScore*100) / 100,
-		ConditionScore:    math.Round(conditionScore*100) / 100,
-		TotalScore:        math.Round(totalScore*100) / 100,
+		PriceScore:        math.Round(priceScore),
+		MileageScore:      math.Round(mileageScore),
+		YearScore:         math.Round(yearScore),
+		ConditionScore:    math.Round(conditionScore),
+		TotalScore:        math.Round(totalScore),
 		DealTier:          tier,
 		DealLabelFa:       labelFa,
 		DealLabelEn:       labelEn,
@@ -212,6 +212,6 @@ func CalculateUtilityScores(listing NormalizedVehicleListing, weights ScoreWeigh
 		BadgeText:         text,
 		BadgeBorder:       border,
 		MedianPriceToman:  marketMedian,
-		PriceDeltaPercent: math.Round(priceDelta*100) / 100,
+		PriceDeltaPercent: math.Round(priceDelta*10) / 10,
 	}
 }
