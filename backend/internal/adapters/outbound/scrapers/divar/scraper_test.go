@@ -23,7 +23,9 @@ func TestScraper_HappyPath(t *testing.T) {
 							"url": "/v/peugeot-206"
 						}
 					},
-					"middle_description_text": "1400 | 20,000 km | بی‌رنگ"
+					"top_description_text": "1402 | 15,000 km",
+					"middle_description_text": "بی‌رنگ",
+					"bottom_description_text": "350,000 تومان"
 				}
 			}
 		]
@@ -57,6 +59,15 @@ func TestScraper_HappyPath(t *testing.T) {
 	if listings[0].BodyStatus != vehicle.BodyStatusPerfect {
 		t.Errorf("expected BodyStatusPerfect, got %s", listings[0].BodyStatus)
 	}
+	if listings[0].PriceToman != 350000 {
+		t.Errorf("expected PriceToman 350000, got %f", listings[0].PriceToman)
+	}
+	if listings[0].Year != 1402 {
+		t.Errorf("expected Year 1402, got %d", listings[0].Year)
+	}
+	if listings[0].MileageKm != 15000 {
+		t.Errorf("expected MileageKm 15000, got %f", listings[0].MileageKm)
+	}
 }
 
 func TestScraper_Fallback(t *testing.T) {
@@ -69,7 +80,7 @@ func TestScraper_Fallback(t *testing.T) {
 	scraper := NewScraper(client)
 	scraper.BaseURL = ts.URL
 
-	criteria := vehicle.SearchCriteria{Query: "206"}
+	criteria := vehicle.SearchCriteria{Query: "206", Type: vehicle.VehicleTypeMotorcycle}
 	listings, err := scraper.Scrape(context.Background(), criteria)
 
 	if err != nil {
@@ -124,5 +135,22 @@ func TestScraper_EmptyDataFallback(t *testing.T) {
 
 	if len(listings) != 5 {
 		t.Fatalf("expected 5 fallback listings due to empty widget list, got %d", len(listings))
+	}
+}
+
+func TestScraper_FetchErrorFallback(t *testing.T) {
+	client := scrapers.NewSharedClient()
+	scraper := NewScraper(client)
+	scraper.BaseURL = "http://invalid-url-that-will-fail.local"
+
+	criteria := vehicle.SearchCriteria{Query: "206"}
+	listings, err := scraper.Scrape(context.Background(), criteria)
+
+	if err != nil {
+		t.Fatalf("expected no error from fallback, got %v", err)
+	}
+
+	if len(listings) != 5 {
+		t.Fatalf("expected 5 fallback listings, got %d", len(listings))
 	}
 }

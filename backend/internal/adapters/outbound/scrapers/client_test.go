@@ -81,3 +81,30 @@ func TestSharedClientFetch_Timeout(t *testing.T) {
 		t.Fatal("expected timeout error, got nil")
 	}
 }
+
+func TestNormalizePersianDigits(t *testing.T) {
+	if got := NormalizePersianDigits("۵۰۰,۰۰۰ تومان"); got != "500000" {
+		t.Errorf("expected 500000, got %s", got)
+	}
+}
+
+func TestExtractNumber(t *testing.T) {
+	if got := ExtractNumber("۵۰۰,۰۰۰ تومان"); got != 500000 {
+		t.Errorf("expected 500000, got %v", got)
+	}
+	if got := ExtractNumber("invalid"); got != 0 {
+		t.Errorf("expected 0, got %v", got)
+	}
+}
+
+func TestExtractYearAndMileage(t *testing.T) {
+	y, m := ExtractYearAndMileage("1402 | 15,000 km | بی‌رنگ")
+	if y != 1402 || m != 15000 {
+		t.Errorf("expected 1402 and 15000, got %d and %v", y, m)
+	}
+
+	y, m = ExtractYearAndMileage("بدون اطلاعات")
+	if y != 1400 || m != 20000 {
+		t.Errorf("expected default 1400 and 20000, got %d and %v", y, m)
+	}
+}

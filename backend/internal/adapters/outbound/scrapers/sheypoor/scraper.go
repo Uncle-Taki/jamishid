@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/adapters/outbound/scrapers"
@@ -39,9 +41,9 @@ type sheypoorResponse struct {
 }
 
 func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.NormalizedVehicleListing, error) {
-	url := fmt.Sprintf("%s?q=%s", s.BaseURL, criteria.Query)
+	searchURL := fmt.Sprintf("%s?q=%s", s.BaseURL, url.QueryEscape(criteria.Query))
 
-	resp, err := s.client.Fetch(ctx, "GET", url, "")
+	resp, err := s.client.Fetch(ctx, "GET", searchURL, "")
 	if err != nil {
 		return s.generateFallback(criteria), nil
 	}
@@ -58,9 +60,20 @@ func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) (
 	var listings []vehicle.NormalizedVehicleListing
 	for _, item := range sResp.Items {
 		var bodyStr string
+		year := 1400
+		mileage := 20000.0
+
 		for _, attr := range item.Attributes {
 			if attr.Key == "body_status" || attr.Key == "وضعیت بدنه" {
 				bodyStr = attr.Value
+			}
+			if attr.Key == "year" || attr.Key == "سال ساخت" {
+				y, _ := strconv.Atoi(scrapers.NormalizePersianDigits(attr.Value))
+				if y > 0 { year = y }
+			}
+			if attr.Key == "mileage" || attr.Key == "کارکرد" {
+				m := scrapers.ExtractNumber(attr.Value)
+				if m > 0 { mileage = m }
 			}
 		}
 
@@ -71,8 +84,8 @@ func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) (
 			Platform:       s.Platform(),
 			Title:          item.Title,
 			PriceToman:     item.Price.Amount,
-			MileageKm:      20000,
-			Year:           1400,
+			MileageKm:      mileage,
+			Year:           year,
 			BodyStatus:     status,
 			URL:            "https://sheypoor.com" + item.URL,
 			ScrapedAt:      time.Now().Format(time.RFC3339),
@@ -98,7 +111,13 @@ func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.No
 
 	var listings []vehicle.NormalizedVehicleListing
 	for i := 0; i < 5; i++ {
-		price := float64(rng.Intn(400)+80) * 1000000
+		var price float64
+		if criteria.Type == vehicle.VehicleTypeMotorcycle {
+			price = float64(rng.Intn(130)+70) * 1000000
+		} else {
+			price = float64(rng.Intn(300)+300) * 1000000
+		}
+
 		mileage := float64(rng.Intn(250) * 1000)
 		year := rng.Intn(10) + 1385
 
@@ -109,6 +128,8 @@ func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.No
 			vehicle.BodyStatusChassisHit,
 		}
 
+		offset := time.Duration(rng.Intn(36)+1) * time.Hour
+
 		listings = append(listings, vehicle.NormalizedVehicleListing{
 			ID:             fmt.Sprintf("sheypoor-%d", rng.Intn(100000)),
 			Platform:       s.Platform(),
@@ -118,7 +139,7 @@ func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.No
 			Year:           year,
 			BodyStatus:     statusOptions[rng.Intn(len(statusOptions))],
 			URL:            "https://sheypoor.com",
-			ScrapedAt:      time.Now().Format(time.RFC3339),
+			ScrapedAt:      time.Now().Add(-offset).Format(time.RFC3339),
 			CityID:         criteria.CitySlug,
 			VehicleType:    criteria.Type,
 		})

@@ -49,7 +49,27 @@ func TestCache_Expiration(t *testing.T) {
 
 	_, found := cache.Get(context.Background(), key)
 	if found {
-		t.Error("expected key to be expired")
+		t.Error("expected key to be expired and not returned")
+	}
+}
+
+func TestCache_Cleanup(t *testing.T) {
+	cache := NewCache(1 * time.Millisecond)
+	key := "my-key"
+	listings := []vehicle.ScoredListing{}
+
+	_ = cache.Set(context.Background(), key, listings)
+
+	time.Sleep(5 * time.Millisecond)
+
+	cache.Cleanup()
+
+	cache.mu.RLock()
+	_, found := cache.items[key]
+	cache.mu.RUnlock()
+
+	if found {
+		t.Error("expected key to be removed by cleanup")
 	}
 }
 

@@ -1,5 +1,5 @@
-# Frontend build config assuming basic React app setup
-FROM node:18-alpine
+# Frontend build config using Node 22 for Vite
+FROM node:22-alpine
 
 WORKDIR /app
 
@@ -11,4 +11,4 @@ COPY . .
 
 EXPOSE 3000
 
-CMD ["npm", "start"]
+CMD ["npm", "run", "dev"]

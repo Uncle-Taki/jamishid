@@ -41,11 +41,20 @@ type divarResponse struct {
 	} `json:"widget_list"`
 }
 
+type divarRequest struct {
+	Query string `json:"query"`
+}
+
 func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.NormalizedVehicleListing, error) {
 	url := s.BaseURL
-	body := fmt.Sprintf(`{"query":"%s"}`, criteria.Query)
 
-	resp, err := s.client.Fetch(ctx, "POST", url, body)
+	reqBody := divarRequest{Query: criteria.Query}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return s.generateFallback(criteria), nil
+	}
+
+	resp, err := s.client.Fetch(ctx, "POST", url, string(bodyBytes))
 	if err != nil {
 		return s.generateFallback(criteria), nil
 	}
@@ -63,13 +72,16 @@ func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) (
 	for _, w := range dResp.WidgetList {
 		status := scrapers.MapBodyStatus(w.Data.MiddleDescriptionText + " " + w.Data.TopDescriptionText)
 
+		price := scrapers.ExtractNumber(w.Data.BottomDescriptionText)
+		year, mileage := scrapers.ExtractYearAndMileage(w.Data.MiddleDescriptionText + " " + w.Data.TopDescriptionText)
+
 		listings = append(listings, vehicle.NormalizedVehicleListing{
 			ID:             w.Data.Token,
 			Platform:       s.Platform(),
 			Title:          w.Data.Title,
-			PriceToman:     500000000,
-			MileageKm:      20000,
-			Year:           1400,
+			PriceToman:     price,
+			MileageKm:      mileage,
+			Year:           year,
 			BodyStatus:     status,
 			URL:            "https://divar.ir" + w.Data.Action.Payload.URL,
 			ScrapedAt:      time.Now().Format(time.RFC3339),
@@ -95,7 +107,13 @@ func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.No
 
 	var listings []vehicle.NormalizedVehicleListing
 	for i := 0; i < 5; i++ {
-		price := float64(rng.Intn(500)+100) * 1000000
+		var price float64
+		if criteria.Type == vehicle.VehicleTypeMotorcycle {
+			price = float64(rng.Intn(130)+70) * 1000000 // 70M - 200M
+		} else {
+			price = float64(rng.Intn(300)+300) * 1000000 // 300M - 600M
+		}
+
 		mileage := float64(rng.Intn(200) * 1000)
 		year := rng.Intn(10) + 1390
 
@@ -106,6 +124,9 @@ func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.No
 			vehicle.BodyStatusChassisHit,
 		}
 
+		// Random ScrapedAt past 1-36 hours
+		offset := time.Duration(rng.Intn(36)+1) * time.Hour
+
 		listings = append(listings, vehicle.NormalizedVehicleListing{
 			ID:             fmt.Sprintf("divar-%d", rng.Intn(100000)),
 			Platform:       s.Platform(),
@@ -115,7 +136,7 @@ func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.No
 			Year:           year,
 			BodyStatus:     statusOptions[rng.Intn(len(statusOptions))],
 			URL:            "https://divar.ir",
-			ScrapedAt:      time.Now().Format(time.RFC3339),
+			ScrapedAt:      time.Now().Add(-offset).Format(time.RFC3339),
 			CityID:         criteria.CitySlug,
 			VehicleType:    criteria.Type,
 		})
