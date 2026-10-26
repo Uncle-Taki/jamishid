@@ -102,8 +102,8 @@ func TestAggregationService_AggregateListings(t *testing.T) {
 	}
 
 	key := generateCacheKey(criteria)
-	if cached, found := cache.Get(ctx, key); !found || len(cached) != 2 {
-		t.Errorf("expected results to be cached")
+	if _, found := cache.Get(ctx, key); found {
+		t.Errorf("partial failures must not be cached")
 	}
 
 	if len(results) == 2 {
@@ -123,8 +123,8 @@ func TestAggregationService_DateCutoff(t *testing.T) {
 	scraper := &mockScraper{
 		platform: vehicle.PlatformDivar,
 		result: []vehicle.NormalizedVehicleListing{
-			{ID: "1", ScrapedAt: nowStr},
-			{ID: "2", ScrapedAt: oldStr},
+			{ID: "1", PublishedAt: nowStr},
+			{ID: "2", PublishedAt: oldStr},
 		},
 	}
 
@@ -140,5 +140,45 @@ func TestAggregationService_DateCutoff(t *testing.T) {
 	}
 	if results[0].ID != "1" {
 		t.Errorf("expected result ID 1")
+	}
+}
+
+func TestAllSourcesFailedIsAnError(t *testing.T) {
+	svc := NewAggregationService([]ports.MarketplaceScraper{&mockScraper{platform: vehicle.PlatformDivar, err: errors.New("blocked")}}, &mockCache{}, vehicle.ScoreWeights{})
+	result, err := svc.AggregateWithSources(context.Background(), vehicle.SearchCriteria{Query: "206"})
+	if !errors.Is(err, ErrSourcesUnavailable) || len(result.Listings) != 0 || len(result.Sources) != 1 || result.Sources[0].Status != "unavailable" {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+}
+
+func TestPartialSourcesReportFailureAndRespectPlatform(t *testing.T) {
+	divar := &mockScraper{platform: vehicle.PlatformDivar, result: []vehicle.NormalizedVehicleListing{{ID: "real", Platform: vehicle.PlatformDivar, PriceToman: 500}}}
+	bama := &mockScraper{platform: vehicle.PlatformBama, err: errors.New("blocked")}
+	svc := NewAggregationService([]ports.MarketplaceScraper{divar, bama}, &mockCache{}, vehicle.ScoreWeights{PriceWeight: 100})
+	result, err := svc.AggregateWithSources(context.Background(), vehicle.SearchCriteria{Query: "206"})
+	if err != nil || len(result.Listings) != 1 || result.Sources[1].Status != "unavailable" {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	p := vehicle.PlatformDivar
+	criteria := vehicle.SearchCriteria{Query: "206", Platform: &p}
+	result, err = svc.AggregateWithSources(context.Background(), criteria)
+	if err != nil || len(result.Sources) != 1 {
+		t.Fatalf("platform filter ignored: %+v %v", result, err)
+	}
+	result, err = svc.AggregateWithSources(context.Background(), criteria)
+	if err != nil || !result.Cached || len(result.Listings) != 1 {
+		t.Fatalf("cache failed: %+v %v", result, err)
+	}
+}
+
+func TestFiltersDoNotTreatUnknownFactsAsKnown(t *testing.T) {
+	hours := 24
+	maxMileage := 1000.0
+	unknown := vehicle.NormalizedVehicleListing{MileageKm: -1, ScrapedAt: time.Now().Format(time.RFC3339)}
+	if matches(unknown, vehicle.SearchCriteria{DateCutoffHours: &hours}) {
+		t.Fatal("fetch time used as publication time")
+	}
+	if matches(unknown, vehicle.SearchCriteria{MaxMileage: &maxMileage}) {
+		t.Fatal("unknown mileage treated as zero")
 	}
 }

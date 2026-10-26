@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/application/aggregation"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"github.com/gin-gonic/gin"
 )
@@ -132,5 +133,41 @@ func TestCrawl_InternalServerError(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("expected status %d, got %d", http.StatusInternalServerError, w.Code)
+	}
+}
+
+type reportingService struct{ mockAggregationService }
+
+func (s *reportingService) AggregateWithSources(context.Context, vehicle.SearchCriteria) (vehicle.CrawlResult, error) {
+	return vehicle.CrawlResult{Sources: []vehicle.SourceStatus{{Platform: vehicle.PlatformDivar, Status: "unavailable", Error: "blocked"}}}, aggregation.ErrSourcesUnavailable
+}
+
+func TestCrawl_UpstreamFailureIs502WithNoSyntheticData(t *testing.T) {
+	router := setupTestRouter(NewAggregationHandler(&reportingService{}))
+	req := httptest.NewRequest("POST", "/api/v1/crawl", bytes.NewBufferString(`{"query":"206"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	var response CrawlResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != 502 || response.Success || response.Data == nil || len(response.Data) != 0 || len(response.Sources) != 1 {
+		t.Fatalf("status=%d response=%+v", w.Code, response)
+	}
+}
+
+func TestCrawl_EmptySearchReturnsArray(t *testing.T) {
+	router := setupTestRouter(NewAggregationHandler(&mockAggregationService{}))
+	req := httptest.NewRequest("POST", "/api/v1/crawl", bytes.NewBufferString(`{"query":"206"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	var response CrawlResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != 200 || !response.Success || response.Data == nil || len(response.Data) != 0 {
+		t.Fatalf("status=%d response=%+v", w.Code, response)
 	}
 }

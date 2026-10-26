@@ -75,14 +75,14 @@ func CalculatePriceScore(price, median float64) float64 {
 
 // CalculateMileageScore computes score based on mileage and Shamsi year
 func CalculateMileageScore(mileage float64, year int, isMotorcycle bool) float64 {
-	if mileage < 0 {
+	if mileage < 0 || year <= 0 {
 		return 50
 	}
 
 	// Dynamically compute current Shamsi year
 	currentShamsiYear := time.Now().Year() - 621
 
-	ageYears := currentShamsiYear - year
+	ageYears := currentShamsiYear - ScoringYear(year)
 	if ageYears < 1 {
 		ageYears = 1 // max(1, ...)
 	}
@@ -130,6 +130,10 @@ func CalculateConditionScore(status BodyStatus) float64 {
 
 // CalculateYearScore assigns a normalized score between minYear and maxYear
 func CalculateYearScore(year, minYear, maxYear int) float64 {
+	if year <= 0 {
+		return 50
+	}
+	year = ScoringYear(year)
 	if minYear >= maxYear {
 		return 100
 	}
@@ -195,7 +199,7 @@ func CalculateUtilityScores(listing NormalizedVehicleListing, weights ScoreWeigh
 	labelFa, labelEn, bg, text, border := GetDealTierLabels(tier)
 
 	var priceDelta float64
-	if marketMedian > 0 {
+	if marketMedian > 0 && listing.PriceToman > 0 {
 		priceDelta = ((listing.PriceToman - marketMedian) / marketMedian) * 100.0
 	}
 
@@ -214,4 +218,13 @@ func CalculateUtilityScores(listing NormalizedVehicleListing, weights ScoreWeigh
 		MedianPriceToman:  marketMedian,
 		PriceDeltaPercent: math.Round(priceDelta*10) / 10,
 	}
+}
+
+// Foreign vehicle model years may be Gregorian; preserve the source year in the
+// listing and normalize only for ranking comparisons.
+func ScoringYear(year int) int {
+	if year >= 1900 {
+		return year - 621
+	}
+	return year
 }

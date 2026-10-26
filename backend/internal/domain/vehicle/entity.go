@@ -19,6 +19,7 @@ const (
 type BodyStatus string
 
 const (
+	BodyStatusUnknown      BodyStatus = "unknown"
 	BodyStatusPerfect      BodyStatus = "perfect"
 	BodyStatusPaintedParts BodyStatus = "painted-parts"
 	BodyStatusFullPaint    BodyStatus = "full-paint"
@@ -35,21 +36,36 @@ const (
 )
 
 type NormalizedVehicleListing struct {
-	ID             string      `json:"id"`
-	Platform       Platform    `json:"platform"`
-	Title          string      `json:"title"`
-	PriceToman     float64     `json:"priceToman"`
-	MileageKm      float64     `json:"mileageKm"`
-	Year           int         `json:"year"`
-	BodyStatus     BodyStatus  `json:"bodyStatus"`
-	URL            string      `json:"url"`
-	ScrapedAt      string      `json:"scrapedAt"` // ISO 8601 string
-	CityID         string      `json:"cityId,omitempty"`
-	NeighborhoodFa string      `json:"neighborhoodFa,omitempty"`
-	ColorFa        string      `json:"colorFa,omitempty"`
-	Gearbox        string      `json:"gearbox,omitempty"`
-	FuelType       string      `json:"fuelType,omitempty"`
-	VehicleType    VehicleType `json:"vehicleType,omitempty"`
+	Attributes      []SourceAttribute `json:"attributes,omitempty"`
+	DetailsStatus   string            `json:"detailsStatus,omitempty"`
+	EngineVolumeCc  float64           `json:"engineVolumeCc,omitempty"`
+	TechnicalStatus string            `json:"technicalStatus,omitempty"`
+	DocumentStatus  string            `json:"documentStatus,omitempty"`
+	BrandModel      string            `json:"brandModel,omitempty"`
+	PublishedAt     string            `json:"publishedAt,omitempty"`
+	ImageURL        string            `json:"imageUrl,omitempty"`
+	ID              string            `json:"id"`
+	Platform        Platform          `json:"platform"`
+	Title           string            `json:"title"`
+	PriceToman      float64           `json:"priceToman"`
+	MileageKm       float64           `json:"mileageKm"`
+	Year            int               `json:"year"`
+	BodyStatus      BodyStatus        `json:"bodyStatus"`
+	URL             string            `json:"url"`
+	ScrapedAt       string            `json:"scrapedAt"` // ISO 8601 string
+	CityID          string            `json:"cityId,omitempty"`
+	NeighborhoodFa  string            `json:"neighborhoodFa,omitempty"`
+	ColorFa         string            `json:"colorFa,omitempty"`
+	Gearbox         string            `json:"gearbox,omitempty"`
+	FuelType        string            `json:"fuelType,omitempty"`
+	VehicleType     VehicleType       `json:"vehicleType,omitempty"`
+}
+
+// SourceAttribute keeps the original labelled value alongside its canonical key.
+type SourceAttribute struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+	Value string `json:"value"`
 }
 
 type ScoreWeights struct {
@@ -78,4 +94,33 @@ type ListingScoreBreakdown struct {
 type ScoredListing struct {
 	NormalizedVehicleListing
 	Score ListingScoreBreakdown `json:"score"`
+}
+
+// SourceStatus describes an actual upstream attempt, including partial failures.
+type SourceStatus struct {
+	NextCursor string   `json:"nextCursor,omitempty"`
+	Page       int      `json:"page,omitempty"`
+	Platform   Platform `json:"platform"`
+	Status     string   `json:"status"`
+	Count      int      `json:"count"`
+	Error      string   `json:"error,omitempty"`
+}
+
+type CrawlResult struct {
+	Listings []ScoredListing
+	Sources  []SourceStatus
+	Cached   bool
+}
+
+type Category struct {
+	ID       string      `json:"id"`
+	Label    string      `json:"label"`
+	ParentID string      `json:"parentId,omitempty"`
+	Type     VehicleType `json:"type"`
+}
+type ListingPage struct {
+	CategoryMatched bool
+	Listings        []NormalizedVehicleListing
+	NextCursor      string
+	Page            int
 }

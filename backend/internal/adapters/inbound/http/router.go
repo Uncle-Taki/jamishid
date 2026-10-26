@@ -24,6 +24,8 @@ func SetupRouter(handler *AggregationHandler) *gin.Engine {
 	{
 		v1.GET("/health", handler.Health)
 		v1.POST("/crawl", handler.Crawl)
+		v1.GET("/categories", handler.Categories)
+		v1.GET("/listing", handler.Listing)
 	}
 
 	return r

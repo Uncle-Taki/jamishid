@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -31,8 +30,15 @@ func (s *SharedClient) Fetch(ctx context.Context, method, url, body string) ([]b
 		return nil, err
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	// Divar may serve an empty SPA shell when HTML category requests also
+	// advertise application/json. Negotiate JSON only for API requests.
+	if method != "GET" || strings.Contains(req.URL.Path, "/api/") {
+		req.Header.Set("Accept", "application/json")
+	}
+	if method != "GET" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -44,7 +50,12 @@ func (s *SharedClient) Fetch(ctx context.Context, method, url, body string) ([]b
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	const maxBody = 8 << 20
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	if len(data) > maxBody {
+		return nil, fmt.Errorf("upstream response exceeds 8 MiB")
+	}
+	return data, err
 }
 
 func MapBodyStatus(persian string) vehicle.BodyStatus {
@@ -55,10 +66,12 @@ func MapBodyStatus(persian string) vehicle.BodyStatus {
 		return vehicle.BodyStatusPaintedParts
 	case strings.Contains(persian, "دور رنگ") || strings.Contains(persian, "تمام رنگ"):
 		return vehicle.BodyStatusFullPaint
-	case strings.Contains(persian, "شاسی"):
+	case strings.Contains(persian, "شاسی خورده") || strings.Contains(persian, "ضربه شاسی") || strings.Contains(persian, "شاسی ضربه"):
 		return vehicle.BodyStatusChassisHit
+	case searchText(persian) == "سالم" || searchText(persian) == "کاملا سالم" || searchText(persian) == "کاملاً سالم":
+		return vehicle.BodyStatusPerfect
 	default:
-		return vehicle.BodyStatusPerfect // Fallback
+		return vehicle.BodyStatusUnknown
 	}
 }
 
@@ -94,31 +107,5 @@ func ExtractNumber(s string) float64 {
 }
 
 func ExtractYearAndMileage(text string) (int, float64) {
-	year := 1400
-	mileage := 20000.0
-
-	norm := NormalizePersianDigits(text)
-
-	// Basic regex for year (1370 - 1405)
-	yearRegex := regexp.MustCompile(`(13[7-9]\d|140[0-5])`)
-	match := yearRegex.FindString(norm)
-	if match != "" {
-		y, _ := strconv.Atoi(match)
-		year = y
-	}
-
-	// Remove the year to not confuse mileage
-	textNoYear := strings.Replace(norm, match, "", 1)
-
-	// Regex for mileage (just the largest number left)
-	numRegex := regexp.MustCompile(`\d+`)
-	matches := numRegex.FindAllString(textNoYear, -1)
-	for _, m := range matches {
-		val, _ := strconv.ParseFloat(m, 64)
-		if val > 100 { // Assuming mileage is > 100 to differentiate from random small numbers
-			mileage = val
-		}
-	}
-
-	return year, mileage
+	return ParseYearMileage(text)
 }

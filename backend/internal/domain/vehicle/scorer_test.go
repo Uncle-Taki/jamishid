@@ -72,7 +72,7 @@ func TestCalculatePriceScore(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := CalculatePriceScore(tt.price, median)
 			if tt.name == "zero median" {
-			   result = CalculatePriceScore(1000, 0)
+				result = CalculatePriceScore(1000, 0)
 			}
 			if math.Abs(result-tt.expected) > 1e-9 {
 				t.Errorf("expected %v, got %v", tt.expected, result)
@@ -161,42 +161,66 @@ func TestCalculateYearScore(t *testing.T) {
 
 func TestGetDealTierLabels(t *testing.T) {
 	_, _, bg, _, _ := GetDealTierLabels(DealTierSuper)
-	if bg != "bg-emerald-500/20" { t.Fail() }
+	if bg != "bg-emerald-500/20" {
+		t.Fail()
+	}
 	_, _, bg, _, _ = GetDealTierLabels(DealTierGood)
-	if bg != "bg-blue-500/20" { t.Fail() }
+	if bg != "bg-blue-500/20" {
+		t.Fail()
+	}
 	_, _, bg, _, _ = GetDealTierLabels(DealTierFair)
-	if bg != "bg-slate-800" { t.Fail() }
+	if bg != "bg-slate-800" {
+		t.Fail()
+	}
 	_, _, bg, _, _ = GetDealTierLabels(DealTierOverpriced)
-	if bg != "bg-rose-500/20" { t.Fail() }
+	if bg != "bg-rose-500/20" {
+		t.Fail()
+	}
 	_, _, bg, _, _ = GetDealTierLabels(DealTier("Unknown"))
-	if bg != "bg-gray-100" { t.Fail() }
+	if bg != "bg-gray-100" {
+		t.Fail()
+	}
 }
 
 func TestClassifyDealTier(t *testing.T) {
-	if ClassifyDealTier(86) != DealTierSuper { t.Fail() }
-	if ClassifyDealTier(75) != DealTierGood { t.Fail() }
-	if ClassifyDealTier(55) != DealTierFair { t.Fail() }
-	if ClassifyDealTier(20) != DealTierOverpriced { t.Fail() }
+	if ClassifyDealTier(86) != DealTierSuper {
+		t.Fail()
+	}
+	if ClassifyDealTier(75) != DealTierGood {
+		t.Fail()
+	}
+	if ClassifyDealTier(55) != DealTierFair {
+		t.Fail()
+	}
+	if ClassifyDealTier(20) != DealTierOverpriced {
+		t.Fail()
+	}
 }
 
 func TestCalculateUtilityScores(t *testing.T) {
 	listing := NormalizedVehicleListing{
-		PriceToman: 500,
-		MileageKm: 10000,
-		Year: 1400,
-		BodyStatus: BodyStatusPerfect,
+		PriceToman:  500,
+		MileageKm:   10000,
+		Year:        1400,
+		BodyStatus:  BodyStatusPerfect,
 		VehicleType: VehicleTypeCar,
 	}
 
 	weights := ScoreWeights{
-		PriceWeight: 40,
+		PriceWeight:     40,
 		ConditionWeight: 30,
-		MileageWeight: 20,
-		YearWeight: 10,
+		MileageWeight:   20,
+		YearWeight:      10,
 	}
 
 	scores := CalculateUtilityScores(listing, weights, 500, 1390, 1405)
-	if scores.PriceScore != 50 { t.Fail() } // 500 == median
-	if scores.ConditionScore != 100 { t.Fail() }
-	if scores.PriceDeltaPercent != 0 { t.Fail() }
+	if scores.PriceScore != 50 {
+		t.Fail()
+	} // 500 == median
+	if scores.ConditionScore != 100 {
+		t.Fail()
+	}
+	if scores.PriceDeltaPercent != 0 {
+		t.Fail()
+	}
 }

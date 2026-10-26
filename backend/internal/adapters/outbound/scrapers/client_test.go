@@ -22,7 +22,7 @@ func TestMapBodyStatus(t *testing.T) {
 		{"دور رنگ میباشد", vehicle.BodyStatusFullPaint},
 		{"تمام رنگ", vehicle.BodyStatusFullPaint},
 		{"شاسی خورده", vehicle.BodyStatusChassisHit},
-		{"نامشخص", vehicle.BodyStatusPerfect},
+		{"نامشخص", vehicle.BodyStatusUnknown},
 	}
 
 	for _, tt := range tests {
@@ -49,6 +49,29 @@ func TestSharedClientFetch_Success(t *testing.T) {
 
 	if string(resp) != `{"success": true}` {
 		t.Errorf("unexpected response: %s", string(resp))
+	}
+}
+
+func TestSharedClientNegotiatesJSONOnlyForAPIs(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/s/tehran/motorcycles" {
+			if r.Header.Get("Accept") != "" {
+				t.Error("HTML request advertises JSON and may receive an empty app shell")
+			}
+		} else if r.Header.Get("Accept") != "application/json" {
+			t.Error("API request is missing JSON content negotiation")
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+	client := NewSharedClient()
+	for _, path := range []string{"/s/tehran/motorcycles", "/api/v10.0.0/search"} {
+		if _, err := client.Fetch(context.Background(), "GET", ts.URL+path, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := client.Fetch(context.Background(), "POST", ts.URL+"/v8/postlist/w/search", `{}`); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -104,7 +127,7 @@ func TestExtractYearAndMileage(t *testing.T) {
 	}
 
 	y, m = ExtractYearAndMileage("بدون اطلاعات")
-	if y != 1400 || m != 20000 {
-		t.Errorf("expected default 1400 and 20000, got %d and %v", y, m)
+	if y != 0 || m != -1 {
+		t.Errorf("expected unknown year 0 and mileage -1, got %d and %v", y, m)
 	}
 }

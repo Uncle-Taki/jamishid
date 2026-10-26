@@ -5,7 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"log"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -40,94 +41,154 @@ func (s *AggregationService) GetCache() ports.ListingCacheRepository {
 	return s.cache
 }
 
+var ErrSourcesUnavailable = errors.New("all selected marketplaces are unavailable")
+
 // AggregateListings coordinates multiple scrapers, gathers results, deduplicates, and scores them.
 func (s *AggregationService) AggregateListings(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.ScoredListing, error) {
+	result, err := s.AggregateWithSources(ctx, criteria)
+	return result.Listings, err
+}
+
+func (s *AggregationService) AggregateWithSources(ctx context.Context, criteria vehicle.SearchCriteria) (vehicle.CrawlResult, error) {
+	result := vehicle.CrawlResult{Listings: []vehicle.ScoredListing{}, Sources: []vehicle.SourceStatus{}}
 	cacheKey := generateCacheKey(criteria)
-
-	if cachedResult, found := s.cache.Get(ctx, cacheKey); found {
-		return cachedResult, nil
+	var selected []ports.MarketplaceScraper
+	for _, sc := range s.scrapers {
+		if (criteria.Platform == nil || *criteria.Platform == sc.Platform()) && (len(criteria.Cursors) == 0 || criteria.Cursors[sc.Platform()] != "") {
+			selected = append(selected, sc)
+		}
 	}
-
-	var allListings []vehicle.NormalizedVehicleListing
-	var mu sync.Mutex
+	if len(selected) == 0 {
+		return result, fmt.Errorf("no matching marketplaces")
+	}
+	if cached, found := s.cache.Get(ctx, cacheKey); found && criteria.BamaCategory == "" && len(criteria.Cursors) == 0 {
+		result.Listings = cached
+		result.Cached = true
+		for _, sc := range selected {
+			count := 0
+			for _, l := range cached {
+				if l.Platform == sc.Platform() {
+					count++
+				}
+			}
+			result.Sources = append(result.Sources, vehicle.SourceStatus{Platform: sc.Platform(), Status: "ok", Count: count})
+		}
+		return result, nil
+	}
+	type sourceResult struct {
+		nextCursor string
+		page       int
+		listings   []vehicle.NormalizedVehicleListing
+		err        error
+	}
+	batches := make([]sourceResult, len(selected))
 	var wg sync.WaitGroup
-
-	for _, scraper := range s.scrapers {
+	for i, sc := range selected {
 		wg.Add(1)
-		go func(sc ports.MarketplaceScraper) {
+		go func(i int, sc ports.MarketplaceScraper) {
 			defer wg.Done()
-
 			scrapeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
-
-			listings, err := sc.Scrape(scrapeCtx, criteria)
-			if err != nil {
-				log.Printf("Error scraping %s: %v", sc.Platform(), err)
-				return
+			if pager, ok := sc.(interface {
+				ScrapePage(context.Context, vehicle.SearchCriteria, string) (vehicle.ListingPage, error)
+			}); ok {
+				page, err := pager.ScrapePage(scrapeCtx, criteria, criteria.Cursors[sc.Platform()])
+				batches[i].listings = page.Listings
+				batches[i].err = err
+				batches[i].nextCursor = page.NextCursor
+				batches[i].page = page.Page
+			} else {
+				batches[i].listings, batches[i].err = sc.Scrape(scrapeCtx, criteria)
 			}
-
-			mu.Lock()
-			allListings = append(allListings, listings...)
-			mu.Unlock()
-		}(scraper)
+		}(i, sc)
 	}
-
 	wg.Wait()
-
-	// Apply date cutoff
-	var filteredListings []vehicle.NormalizedVehicleListing
-	if criteria.DateCutoffHours != nil {
-		cutoffTime := time.Now().Add(-time.Duration(*criteria.DateCutoffHours) * time.Hour)
-		for _, l := range allListings {
-			t, err := time.Parse(time.RFC3339, l.ScrapedAt)
-			if err == nil && t.After(cutoffTime) {
-				filteredListings = append(filteredListings, l)
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+	var filtered []vehicle.NormalizedVehicleListing
+	seen := map[string]bool{}
+	successes := 0
+	failed := false
+	for i, batch := range batches {
+		status := vehicle.SourceStatus{Platform: selected[i].Platform(), Status: "ok", NextCursor: batch.nextCursor, Page: batch.page}
+		if batch.err != nil {
+			status.Status = "unavailable"
+			status.Error = batch.err.Error()
+			status.NextCursor = criteria.Cursors[selected[i].Platform()]
+			failed = true
+		} else {
+			successes++
+		}
+		for _, l := range batch.listings {
+			if batch.err != nil {
+				break
 			}
+			key := string(l.Platform) + ":" + l.ID
+			if seen[key] || !matches(l, criteria) {
+				continue
+			}
+			seen[key] = true
+			filtered = append(filtered, l)
+			status.Count++
 		}
-	} else {
-		filteredListings = allListings
+		result.Sources = append(result.Sources, status)
 	}
-
-	if len(filteredListings) == 0 {
-		return []vehicle.ScoredListing{}, nil
+	if successes == 0 {
+		return result, ErrSourcesUnavailable
 	}
-
-	marketMedian := vehicle.CalculateBatchMedianPrice(filteredListings)
-
-	minYear := 9999
-	maxYear := 0
-	for _, l := range filteredListings {
-		if l.Year < minYear {
-			minYear = l.Year
+	median := vehicle.CalculateBatchMedianPrice(filtered)
+	minYear, maxYear := 9999, 0
+	for _, l := range filtered {
+		y := vehicle.ScoringYear(l.Year)
+		if y > 0 && y < minYear {
+			minYear = y
 		}
-		if l.Year > maxYear {
-			maxYear = l.Year
+		if y > maxYear {
+			maxYear = y
 		}
 	}
-
-	// Use dynamic weights if provided, else fallback to service default
-	activeWeights := s.weights
+	weights := s.weights
 	if criteria.Weights != nil {
-		activeWeights = *criteria.Weights
+		weights = *criteria.Weights
 	}
-
-	var scoredListings []vehicle.ScoredListing
-	for _, listing := range filteredListings {
-		scores := vehicle.CalculateUtilityScores(listing, activeWeights, marketMedian, minYear, maxYear)
-
-		scoredListings = append(scoredListings, vehicle.ScoredListing{
-			NormalizedVehicleListing: listing,
-			Score:                    scores,
-		})
+	for _, l := range filtered {
+		result.Listings = append(result.Listings, vehicle.ScoredListing{NormalizedVehicleListing: l, Score: vehicle.CalculateUtilityScores(l, weights, median, minYear, maxYear)})
 	}
+	sort.SliceStable(result.Listings, func(i, j int) bool { return result.Listings[i].Score.TotalScore > result.Listings[j].Score.TotalScore })
+	// Do not hide partial failures behind a later cache hit.
+	if !failed && criteria.BamaCategory == "" && len(criteria.Cursors) == 0 {
+		_ = s.cache.Set(ctx, cacheKey, result.Listings)
+	}
+	return result, nil
+}
 
-	sort.SliceStable(scoredListings, func(i, j int) bool {
-		return scoredListings[i].Score.TotalScore > scoredListings[j].Score.TotalScore
-	})
-
-	_ = s.cache.Set(ctx, cacheKey, scoredListings)
-
-	return scoredListings, nil
+func matches(l vehicle.NormalizedVehicleListing, c vehicle.SearchCriteria) bool {
+	if c.MinPrice != nil && (l.PriceToman <= 0 || l.PriceToman < *c.MinPrice) {
+		return false
+	}
+	if c.MaxPrice != nil && (l.PriceToman <= 0 || l.PriceToman > *c.MaxPrice) {
+		return false
+	}
+	if c.MinYear != nil && (l.Year <= 0 || vehicle.ScoringYear(l.Year) < *c.MinYear) {
+		return false
+	}
+	if c.MaxYear != nil && (l.Year <= 0 || vehicle.ScoringYear(l.Year) > *c.MaxYear) {
+		return false
+	}
+	if c.MinMileage != nil && (l.MileageKm < 0 || l.MileageKm < *c.MinMileage) {
+		return false
+	}
+	if c.MaxMileage != nil && (l.MileageKm < 0 || l.MileageKm > *c.MaxMileage) {
+		return false
+	}
+	if c.DateCutoffHours != nil {
+		t, err := time.Parse(time.RFC3339, l.PublishedAt)
+		if err != nil || t.Before(time.Now().Add(-time.Duration(*c.DateCutoffHours)*time.Hour)) {
+			return false
+		}
+	}
+	return true
 }
 
 func generateCacheKey(criteria vehicle.SearchCriteria) string {

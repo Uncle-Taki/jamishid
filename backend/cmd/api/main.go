@@ -22,6 +22,11 @@ import (
 
 func main() {
 	sharedClient := scrapers.NewSharedClient()
+	if path := os.Getenv("CATEGORY_CATALOG_PATH"); path != "" {
+		if err := scrapers.DefaultProviderCatalog().LoadSnapshot(path); err != nil {
+			log.Printf("Category snapshot not loaded; using live discovery: %v", err)
+		}
+	}
 
 	divarScraper := divar.NewScraper(sharedClient)
 	bamaScraper := bama.NewScraper(sharedClient)

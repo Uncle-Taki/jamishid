@@ -2,11 +2,6 @@ package divar
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"math/rand"
-	"time"
-
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/adapters/outbound/scrapers"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 )
@@ -17,129 +12,15 @@ type Scraper struct {
 }
 
 func NewScraper(client *scrapers.SharedClient) *Scraper {
-	return &Scraper{
-		client:  client,
-		BaseURL: "https://api.divar.ir/v8/postlist/w/search",
-	}
-}
-
-type divarResponse struct {
-	WidgetList []struct {
-		Data struct {
-			Token       string `json:"token"`
-			Title       string `json:"title"`
-			Image       string `json:"image"`
-			Action      struct {
-				Payload struct {
-					URL string `json:"url"`
-				} `json:"payload"`
-			} `json:"action"`
-			MiddleDescriptionText string `json:"middle_description_text"`
-			TopDescriptionText    string `json:"top_description_text"`
-			BottomDescriptionText string `json:"bottom_description_text"`
-		} `json:"data"`
-	} `json:"widget_list"`
-}
-
-type divarRequest struct {
-	Query string `json:"query"`
+	return &Scraper{client: client, BaseURL: "https://divar.ir"}
 }
 
 func (s *Scraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.NormalizedVehicleListing, error) {
-	url := s.BaseURL
-
-	reqBody := divarRequest{Query: criteria.Query}
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return s.generateFallback(criteria), nil
-	}
-
-	resp, err := s.client.Fetch(ctx, "POST", url, string(bodyBytes))
-	if err != nil {
-		return s.generateFallback(criteria), nil
-	}
-
-	var dResp divarResponse
-	if err := json.Unmarshal(resp, &dResp); err != nil {
-		return s.generateFallback(criteria), nil
-	}
-
-	if len(dResp.WidgetList) == 0 {
-		return s.generateFallback(criteria), nil
-	}
-
-	var listings []vehicle.NormalizedVehicleListing
-	for _, w := range dResp.WidgetList {
-		status := scrapers.MapBodyStatus(w.Data.MiddleDescriptionText + " " + w.Data.TopDescriptionText)
-
-		price := scrapers.ExtractNumber(w.Data.BottomDescriptionText)
-		year, mileage := scrapers.ExtractYearAndMileage(w.Data.MiddleDescriptionText + " " + w.Data.TopDescriptionText)
-
-		listings = append(listings, vehicle.NormalizedVehicleListing{
-			ID:             w.Data.Token,
-			Platform:       s.Platform(),
-			Title:          w.Data.Title,
-			PriceToman:     price,
-			MileageKm:      mileage,
-			Year:           year,
-			BodyStatus:     status,
-			URL:            "https://divar.ir" + w.Data.Action.Payload.URL,
-			ScrapedAt:      time.Now().Format(time.RFC3339),
-			CityID:         criteria.CitySlug,
-			VehicleType:    criteria.Type,
-		})
-	}
-
-	return listings, nil
+	return scrapers.PublicPage(ctx, s.client, s.BaseURL, s.Platform(), criteria)
 }
 
-func (s *Scraper) Platform() vehicle.Platform {
-	return vehicle.PlatformDivar
-}
+func (s *Scraper) Platform() vehicle.Platform { return vehicle.PlatformDivar }
 
-func (s *Scraper) generateFallback(criteria vehicle.SearchCriteria) []vehicle.NormalizedVehicleListing {
-	seed := criteria.Query + criteria.CitySlug + string(s.Platform())
-	var seedInt int64
-	for _, c := range seed {
-		seedInt += int64(c)
-	}
-	rng := rand.New(rand.NewSource(seedInt))
-
-	var listings []vehicle.NormalizedVehicleListing
-	for i := 0; i < 5; i++ {
-		var price float64
-		if criteria.Type == vehicle.VehicleTypeMotorcycle {
-			price = float64(rng.Intn(130)+70) * 1000000 // 70M - 200M
-		} else {
-			price = float64(rng.Intn(300)+300) * 1000000 // 300M - 600M
-		}
-
-		mileage := float64(rng.Intn(200) * 1000)
-		year := rng.Intn(10) + 1390
-
-		statusOptions := []vehicle.BodyStatus{
-			vehicle.BodyStatusPerfect,
-			vehicle.BodyStatusPaintedParts,
-			vehicle.BodyStatusFullPaint,
-			vehicle.BodyStatusChassisHit,
-		}
-
-		// Random ScrapedAt past 1-36 hours
-		offset := time.Duration(rng.Intn(36)+1) * time.Hour
-
-		listings = append(listings, vehicle.NormalizedVehicleListing{
-			ID:             fmt.Sprintf("divar-%d", rng.Intn(100000)),
-			Platform:       s.Platform(),
-			Title:          fmt.Sprintf("%s (Divar fallback)", criteria.Query),
-			PriceToman:     price,
-			MileageKm:      mileage,
-			Year:           year,
-			BodyStatus:     statusOptions[rng.Intn(len(statusOptions))],
-			URL:            "https://divar.ir",
-			ScrapedAt:      time.Now().Add(-offset).Format(time.RFC3339),
-			CityID:         criteria.CitySlug,
-			VehicleType:    criteria.Type,
-		})
-	}
-	return listings
+func (s *Scraper) ScrapePage(ctx context.Context, criteria vehicle.SearchCriteria, cursor string) (vehicle.ListingPage, error) {
+	return scrapers.PublicSearchPage(ctx, s.client, s.BaseURL, s.Platform(), criteria, cursor)
 }

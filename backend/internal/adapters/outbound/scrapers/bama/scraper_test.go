@@ -2,156 +2,52 @@ package bama
 
 import (
 	"context"
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/adapters/outbound/scrapers"
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/adapters/outbound/scrapers"
-	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 )
 
-func TestScraper_HappyPath(t *testing.T) {
-	mockResponse := `
-	{
-		"data": {
-			"ads": [
-				{
-					"code": "bama-123",
-					"title": "Samand",
-					"detail": {
-						"year": "1403",
-						"mileage": "15,000",
-						"body": "چند لکه"
-					},
-					"price": {
-						"price": 3000000000
-					},
-					"url": "/car/samand"
-				}
-			]
+func TestScraper_PublicSearch(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Query().Get("region") != "tehran" || r.URL.Path != "/car/peugeot" {
+			t.Errorf("wrong search request: %s", r.URL)
 		}
-	}
-	`
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(mockResponse))
+		w.Write([]byte(`<script id="__NUXT_DATA__" type="application/json">[{"code":1,"title":2,"trim":3,"url":4,"year":5,"mileage":6,"body_status":7,"price":8,"location":10},"real-token","پژو 206","تیپ 5","/car/detail-real-token","1402","کارکرد 15,000 کیلومتر","بدون رنگ",{"price":9},"350,000,000","تهران، مرکز"]</script>`))
 	}))
 	defer ts.Close()
-
-	client := scrapers.NewSharedClient()
-	scraper := NewScraper(client)
-	scraper.BaseURL = ts.URL
-
-	criteria := vehicle.SearchCriteria{Query: "samand"}
-	listings, err := scraper.Scrape(context.Background(), criteria)
-
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+	sc := NewScraper(scrapers.NewSharedClient())
+	sc.BaseURL = ts.URL
+	rows, err := sc.Scrape(context.Background(), vehicle.SearchCriteria{Query: "پژو 206", CitySlug: "tehran"})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows=%v error=%v", rows, err)
 	}
-
-	if len(listings) != 1 {
-		t.Fatalf("expected 1 listing, got %d", len(listings))
+	if rows[0].PriceToman != 350000000 {
+		t.Errorf("wrong Toman price: %v", rows[0].PriceToman)
 	}
-
-	if listings[0].ID != "bama-123" {
-		t.Errorf("expected ID bama-123, got %s", listings[0].ID)
-	}
-	if listings[0].PriceToman != 300000000 {
-		t.Errorf("expected Toman price 300,000,000, got %f", listings[0].PriceToman)
-	}
-	if listings[0].BodyStatus != vehicle.BodyStatusPaintedParts {
-		t.Errorf("expected BodyStatusPaintedParts, got %s", listings[0].BodyStatus)
-	}
-	if listings[0].Year != 1403 {
-		t.Errorf("expected Year 1403, got %d", listings[0].Year)
-	}
-	if listings[0].MileageKm != 15000 {
-		t.Errorf("expected MileageKm 15000, got %f", listings[0].MileageKm)
+	if rows[0].ID != "bama-real-token" && rows[0].ID != "bama-car-real-token.html" {
+		t.Errorf("wrong ID: %s", rows[0].ID)
 	}
 }
 
-func TestScraper_Fallback(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-	}))
-	defer ts.Close()
-
-	client := scrapers.NewSharedClient()
-	scraper := NewScraper(client)
-	scraper.BaseURL = ts.URL
-
-	criteria := vehicle.SearchCriteria{Query: "samand", Type: vehicle.VehicleTypeMotorcycle}
-	listings, err := scraper.Scrape(context.Background(), criteria)
-
-	if err != nil {
-		t.Fatalf("expected no error from fallback, got %v", err)
-	}
-
-	if len(listings) != 5 {
-		t.Fatalf("expected 5 fallback listings, got %d", len(listings))
-	}
-}
-
-func TestScraper_MalformedJSON(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{malformed json`))
-	}))
-	defer ts.Close()
-
-	client := scrapers.NewSharedClient()
-	scraper := NewScraper(client)
-	scraper.BaseURL = ts.URL
-
-	criteria := vehicle.SearchCriteria{Query: "samand"}
-	listings, err := scraper.Scrape(context.Background(), criteria)
-
-	if err != nil {
-		t.Fatalf("expected no error from fallback, got %v", err)
-	}
-
-	if len(listings) != 5 {
-		t.Fatalf("expected 5 fallback listings, got %d", len(listings))
-	}
-}
-
-func TestScraper_EmptyDataFallback(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"data": {"ads": []}}`))
-	}))
-	defer ts.Close()
-
-	client := scrapers.NewSharedClient()
-	scraper := NewScraper(client)
-	scraper.BaseURL = ts.URL
-
-	criteria := vehicle.SearchCriteria{Query: "samand"}
-	listings, err := scraper.Scrape(context.Background(), criteria)
-
-	if err != nil {
-		t.Fatalf("expected no error from fallback, got %v", err)
-	}
-
-	if len(listings) != 5 {
-		t.Fatalf("expected 5 fallback listings due to empty ads list, got %d", len(listings))
-	}
-}
-
-func TestScraper_FetchErrorFallback(t *testing.T) {
-	client := scrapers.NewSharedClient()
-	scraper := NewScraper(client)
-	scraper.BaseURL = "http://invalid-url-that-will-fail.local"
-
-	criteria := vehicle.SearchCriteria{Query: "samand"}
-	listings, err := scraper.Scrape(context.Background(), criteria)
-
-	if err != nil {
-		t.Fatalf("expected no error from fallback, got %v", err)
-	}
-
-	if len(listings) != 5 {
-		t.Fatalf("expected 5 fallback listings, got %d", len(listings))
+func TestScraper_FailuresNeverGenerateListings(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"blocked", 403, "blocked"}, {"malformed", 200, "<html>unexpected schema</html>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); w.Write([]byte(tc.body)) }))
+			defer ts.Close()
+			sc := NewScraper(scrapers.NewSharedClient())
+			sc.BaseURL = ts.URL
+			rows, err := sc.Scrape(context.Background(), vehicle.SearchCriteria{Query: "206"})
+			if err == nil || len(rows) != 0 {
+				t.Fatalf("upstream failure produced rows=%v error=%v", rows, err)
+			}
+		})
 	}
 }
