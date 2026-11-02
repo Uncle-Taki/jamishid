@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/adapters/outbound/scrapers"
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/application/crawljobs"
 	"math"
 	"net/http"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 )
 
 type AggregationHandler struct {
+	jobs            crawljobs.Repository
 	catalog         *scrapers.CategoryCatalog
 	providerCatalog *scrapers.ProviderCatalog
 	service         ports.AggregationUseCase

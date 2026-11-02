@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -10,90 +11,87 @@ import (
 )
 
 func TestCache_Miss(t *testing.T) {
-	cache := NewCache(1 * time.Minute)
-	_, found := cache.Get(context.Background(), "unknown")
-	if found {
-		t.Error("expected to not find key")
+	if _, found := NewCache(24*time.Hour).Get(context.Background(), "unknown"); found {
+		t.Fatal("unexpected cache hit")
 	}
 }
 
-func TestCache_Hit(t *testing.T) {
-	cache := NewCache(1 * time.Minute)
-	key := "my-key"
-	listings := []vehicle.ScoredListing{
-		{NormalizedVehicleListing: vehicle.NormalizedVehicleListing{ID: "1"}},
+func TestCache_HitPreservesPageAndOwnsItsData(t *testing.T) {
+	cache := NewCache(24 * time.Hour)
+	page := vehicle.ListingPage{Page: 2, NextCursor: "next", CategoryMatched: true,
+		Listings: []vehicle.NormalizedVehicleListing{{ID: "one", Attributes: []vehicle.SourceAttribute{{Key: "color", Value: "black"}}}}}
+	if err := cache.Set(context.Background(), "key", page); err != nil {
+		t.Fatal(err)
 	}
-
-	err := cache.Set(context.Background(), key, listings)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	page.Listings[0].ID = "changed"
+	page.Listings[0].Attributes[0].Value = "changed"
+	got, found := cache.Get(context.Background(), "key")
+	if !found || got.Page != 2 || got.NextCursor != "next" || !got.CategoryMatched || got.Listings[0].ID != "one" || got.Listings[0].Attributes[0].Value != "black" {
+		t.Fatalf("page or ownership lost: %+v", got)
 	}
-
-	cachedListings, found := cache.Get(context.Background(), key)
-	if !found {
-		t.Fatal("expected to find key")
-	}
-	if len(cachedListings) != 1 || cachedListings[0].ID != "1" {
-		t.Error("cached data mismatch")
-	}
-}
-
-func TestCache_Expiration(t *testing.T) {
-	cache := NewCache(1 * time.Millisecond)
-	key := "my-key"
-	listings := []vehicle.ScoredListing{}
-
-	_ = cache.Set(context.Background(), key, listings)
-
-	time.Sleep(5 * time.Millisecond)
-
-	_, found := cache.Get(context.Background(), key)
-	if found {
-		t.Error("expected key to be expired and not returned")
+	got.Listings[0].Attributes[0].Value = "changed again"
+	got.Listings[0].ID = "changed again"
+	again, _ := cache.Get(context.Background(), "key")
+	if again.Listings[0].ID != "one" || again.Listings[0].Attributes[0].Value != "black" {
+		t.Fatal("caller mutated cached data")
 	}
 }
 
-func TestCache_Cleanup(t *testing.T) {
-	cache := NewCache(1 * time.Millisecond)
-	key := "my-key"
-	listings := []vehicle.ScoredListing{}
+func TestCache_ExpirationAt24HoursIsNotExtendedByReads(t *testing.T) {
+	cache := NewCache(24 * time.Hour)
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	cache.now = func() time.Time { return now }
+	_ = cache.Set(context.Background(), "key", vehicle.ListingPage{})
+	now = now.Add(24*time.Hour - time.Nanosecond)
+	if _, found := cache.Get(context.Background(), "key"); !found {
+		t.Fatal("expired before 24 hours")
+	}
+	now = now.Add(time.Nanosecond)
+	if _, found := cache.Get(context.Background(), "key"); found {
+		t.Fatal("still valid at TTL boundary")
+	}
+	if len(cache.items) != 0 {
+		t.Fatal("expired entry not removed")
+	}
+}
 
-	_ = cache.Set(context.Background(), key, listings)
-
-	time.Sleep(5 * time.Millisecond)
-
+func TestCache_CleanupAndCapacity(t *testing.T) {
+	cache := NewCache(24 * time.Hour)
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	cache.now = func() time.Time { return now }
+	for i := 0; i <= maxCacheEntries; i++ {
+		_ = cache.Set(context.Background(), fmt.Sprint(i), vehicle.ListingPage{})
+		now = now.Add(time.Second)
+	}
+	if len(cache.items) != maxCacheEntries {
+		t.Fatalf("unbounded cache: %d", len(cache.items))
+	}
+	if _, found := cache.Get(context.Background(), "0"); found {
+		t.Fatal("oldest entry not evicted")
+	}
+	if _, found := cache.Get(context.Background(), fmt.Sprint(maxCacheEntries)); !found {
+		t.Fatal("new entry not cached")
+	}
+	now = now.Add(24 * time.Hour)
 	cache.Cleanup()
-
-	cache.mu.RLock()
-	_, found := cache.items[key]
-	cache.mu.RUnlock()
-
-	if found {
-		t.Error("expected key to be removed by cleanup")
+	if len(cache.items) != 0 {
+		t.Fatal("cleanup retained expired pages")
 	}
 }
 
 func TestCache_Concurrency(t *testing.T) {
-	cache := NewCache(1 * time.Minute)
-	key := "concurrent-key"
-	listings := []vehicle.ScoredListing{{}}
-
+	cache := NewCache(24 * time.Hour)
 	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 100; i++ {
-			_ = cache.Set(context.Background(), key, listings)
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 100; i++ {
-			_, _ = cache.Get(context.Background(), key)
-		}
-	}()
-
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_ = cache.Set(context.Background(), "key", vehicle.ListingPage{Page: j})
+				_, _ = cache.Get(context.Background(), "key")
+				cache.Cleanup()
+			}
+		}()
+	}
 	wg.Wait()
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 )
 
@@ -24,7 +25,7 @@ func NewSharedClient() *SharedClient {
 	}
 }
 
-func (s *SharedClient) Fetch(ctx context.Context, method, url, body string) ([]byte, error) {
+func (s *SharedClient) fetchOnce(ctx context.Context, method, url, body string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -45,15 +46,19 @@ func (s *SharedClient) Fetch(ctx context.Context, method, url, body string) ([]b
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if hint, ok := ctx.Value(retryAfterKey{}).(*responseHint); ok {
+		hint.status = resp.StatusCode
+		hint.delay = retryAfter(resp.Header.Get("Retry-After"), time.Now())
+	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, &ports.SourceError{Kind: "http", StatusCode: resp.StatusCode, Err: fmt.Errorf("unexpected status code: %d", resp.StatusCode)}
 	}
 
 	const maxBody = 8 << 20
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if len(data) > maxBody {
-		return nil, fmt.Errorf("upstream response exceeds 8 MiB")
+		return nil, &ports.SourceError{Kind: "body_limit", StatusCode: resp.StatusCode, Err: fmt.Errorf("upstream response exceeds 8 MiB")}
 	}
 	return data, err
 }

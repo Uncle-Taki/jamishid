@@ -67,6 +67,9 @@ func applyAttribute(l *vehicle.NormalizedVehicleListing, label, value string) {
 	case "سوخت", "نوع سوخت":
 		key = "fuelType"
 		l.FuelType = value
+	case "تیپ", "مدل تیپ":
+		key = "trimName"
+		l.TrimName = value
 	case "برند و مدل":
 		key = "brandModel"
 		l.BrandModel = value

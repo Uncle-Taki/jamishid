@@ -7,12 +7,15 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"golang.org/x/net/html"
+	"golang.org/x/sync/singleflight"
 )
 
 type detailEntry struct {
@@ -24,7 +27,24 @@ var detailCache = struct {
 	sync.Mutex
 	entries map[string]detailEntry
 }{entries: map[string]detailEntry{}}
+var sharedDetails ports.ListingDetailCache
+
+// ConfigureDetailCache is called once before serving requests. Nil retains the
+// bounded local cache for standalone use and fixture tests.
+func ConfigureDetailCache(cache ports.ListingDetailCache) { sharedDetails = cache }
+func readDetails(ctx context.Context, key string) (vehicle.NormalizedVehicleListing, bool) {
+	if sharedDetails != nil {
+		return sharedDetails.GetDetail(ctx, key)
+	}
+	return cachedDetails(key)
+}
+
 var detailSlots = make(chan struct{}, 4)
+var detailRequests singleflight.Group
+
+const detailCacheTTL = 24 * time.Hour
+const maxDetailEntries = 5000
+
 var publicPostToken = regexp.MustCompile(`^[A-Za-z0-9_-]{6,64}$`)
 var detailPace = struct {
 	sync.Mutex
@@ -52,6 +72,12 @@ func waitDetailRequest(ctx context.Context, platform vehicle.Platform) bool {
 // Detail failures never discard an otherwise valid listing. The page deadline
 // bounds work, while cached detail facts are reused across searches and cities.
 func enrichListings(ctx context.Context, client *SharedClient, rows []vehicle.NormalizedVehicleListing) {
+	platform := vehicle.Platform("")
+	if len(rows) > 0 {
+		platform = rows[0].Platform
+	}
+	ctx, finish := observer.Start(ctx, "enrichment", platform)
+	defer func() { finish(ports.Observation{Listings: len(rows)}) }()
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -59,66 +85,144 @@ func enrichListings(ctx context.Context, client *SharedClient, rows []vehicle.No
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			select {
-			case detailSlots <- struct{}{}:
-				defer func() { <-detailSlots }()
-			case <-ctx.Done():
-				rows[i].DetailsStatus = "partial"
-				return
-			}
-			original := rows[i]
-			if !validDetailURL(original.URL, original.Platform) {
-				rows[i].DetailsStatus = "partial"
-				return
-			}
-			detailCache.Lock()
-			entry, ok := detailCache.entries[original.URL]
-			detailCache.Unlock()
-			if ok && time.Now().Before(entry.expires) {
-				mergeDetails(&rows[i], entry.listing)
-				return
-			}
-			if !waitDetailRequest(ctx, original.Platform) {
-				rows[i].DetailsStatus = "partial"
-				return
-			}
-			fetchURL := original.URL
-			if original.Platform == vehicle.PlatformDivar {
-				u, _ := url.Parse(original.URL)
-				token := path.Base(u.Path)
-				if !publicPostToken.MatchString(token) {
-					rows[i].DetailsStatus = "partial"
-					return
-				}
-				fetchURL = "https://api.divar.ir/v8/posts-v2/web/" + token
-			}
-			body, err := client.Fetch(ctx, "GET", fetchURL, "")
+			facts, err := listingDetails(ctx, client, rows[i].Platform, rows[i].URL)
 			if err != nil {
 				rows[i].DetailsStatus = "partial"
 				return
 			}
-			facts, err := parseListingDetails(body, original.Platform)
-			if err != nil {
-				rows[i].DetailsStatus = "partial"
-				return
-			}
-			facts.DetailsStatus = "complete"
-			detailCache.Lock()
-			if len(detailCache.entries) > 5000 {
-				for key, e := range detailCache.entries {
-					if time.Now().After(e.expires) {
-						delete(detailCache.entries, key)
-					}
-				}
-			}
-			if len(detailCache.entries) < 5000 {
-				detailCache.entries[original.URL] = detailEntry{listing: facts, expires: time.Now().Add(30 * time.Minute)}
-			}
-			detailCache.Unlock()
 			mergeDetails(&rows[i], facts)
 		}(i)
 	}
 	wg.Wait()
+}
+
+func listingDetails(ctx context.Context, client *SharedClient, platform vehicle.Platform, rawURL string) (vehicle.NormalizedVehicleListing, error) {
+	if err := ctx.Err(); err != nil {
+		return missingListing(), err
+	}
+	if !validDetailURL(rawURL, platform) {
+		return missingListing(), fmt.Errorf("invalid listing URL")
+	}
+	u, _ := url.Parse(rawURL)
+	u.Host = strings.TrimPrefix(u.Hostname(), "www.")
+	u.RawQuery, u.Fragment = "", ""
+	key := string(platform) + ":" + u.String()
+	fetchURL := u.String()
+	if platform == vehicle.PlatformDivar {
+		token := path.Base(u.Path)
+		if !publicPostToken.MatchString(token) {
+			return missingListing(), fmt.Errorf("invalid listing token")
+		}
+		key = string(platform) + ":" + token
+		fetchURL = "https://api.divar.ir/v8/posts-v2/web/" + token
+	}
+	if facts, ok := readDetails(ctx, key); ok && !ports.CrawlPolicyFrom(ctx).RefreshDetails {
+		_, done := observer.Start(ctx, "detail_cache", platform)
+		done(ports.Observation{Cache: "hit"})
+		return facts, nil
+	}
+	_, cacheDone := observer.Start(ctx, "detail_cache", platform)
+	cacheDone(ports.Observation{Cache: "miss"})
+	ready := detailRequests.DoChan(key, func() (any, error) {
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+		defer cancel()
+		fetch := func(fetchCtx context.Context) (vehicle.NormalizedVehicleListing, error) {
+			select {
+			case detailSlots <- struct{}{}:
+				defer func() { <-detailSlots }()
+			case <-fetchCtx.Done():
+				return missingListing(), fetchCtx.Err()
+			}
+			if !waitDetailRequest(fetchCtx, platform) {
+				return missingListing(), fetchCtx.Err()
+			}
+			body, err := client.Fetch(fetchCtx, "GET", fetchURL, "")
+			if err != nil {
+				return missingListing(), err
+			}
+			_, parseDone := observer.Start(fetchCtx, "detail_parse", platform)
+			facts, err := parseListingDetails(body, platform)
+			if err != nil {
+				err = &ports.SourceError{Kind: "parser", Err: err}
+			}
+			parseDone(ports.Observation{Error: err})
+			if err != nil {
+				return missingListing(), err
+			}
+			if err := fetchCtx.Err(); err != nil {
+				return missingListing(), err
+			}
+			facts.DetailsStatus = "complete"
+			return facts, nil
+		}
+		if refresher, ok := sharedDetails.(ports.ListingDetailRefresher); ok && ports.CrawlPolicyFrom(fetchCtx).RefreshDetails {
+			facts, _, err := refresher.RefreshDetail(fetchCtx, key, fetch)
+			return facts, err
+		}
+		if sharedDetails != nil {
+			facts, _, err := sharedDetails.LoadDetail(fetchCtx, key, fetch)
+			return facts, err
+		}
+		if facts, ok := cachedDetails(key); ok {
+			return facts, nil
+		}
+		facts, err := fetch(fetchCtx)
+		if err == nil {
+			storeDetails(key, facts)
+		}
+		return facts, err
+	})
+	select {
+	case <-ctx.Done():
+		return missingListing(), ctx.Err()
+	case result := <-ready:
+		if result.Err != nil {
+			return missingListing(), result.Err
+		}
+		facts := result.Val.(vehicle.NormalizedVehicleListing)
+		facts.Attributes = slices.Clone(facts.Attributes)
+		return facts, nil
+	}
+}
+
+func cachedDetails(key string) (vehicle.NormalizedVehicleListing, bool) {
+	detailCache.Lock()
+	defer detailCache.Unlock()
+	entry, ok := detailCache.entries[key]
+	if !ok {
+		return vehicle.NormalizedVehicleListing{}, false
+	}
+	if !time.Now().Before(entry.expires) {
+		delete(detailCache.entries, key)
+		return vehicle.NormalizedVehicleListing{}, false
+	}
+	entry.listing.Attributes = slices.Clone(entry.listing.Attributes)
+	return entry.listing, true
+}
+
+func storeDetails(key string, facts vehicle.NormalizedVehicleListing) {
+	detailCache.Lock()
+	defer detailCache.Unlock()
+	now := time.Now()
+	if len(detailCache.entries) >= maxDetailEntries {
+		for key, entry := range detailCache.entries {
+			if !now.Before(entry.expires) {
+				delete(detailCache.entries, key)
+			}
+		}
+		if len(detailCache.entries) >= maxDetailEntries {
+			var oldest string
+			var expires time.Time
+			for key, entry := range detailCache.entries {
+				if expires.IsZero() || entry.expires.Before(expires) {
+					oldest, expires = key, entry.expires
+				}
+			}
+			delete(detailCache.entries, oldest)
+		}
+	}
+	facts.Attributes = slices.Clone(facts.Attributes)
+	detailCache.entries[key] = detailEntry{listing: facts, expires: now.Add(detailCacheTTL)}
 }
 
 func mergeDetails(l *vehicle.NormalizedVehicleListing, d vehicle.NormalizedVehicleListing) {
@@ -407,4 +511,19 @@ func FetchListingDetails(ctx context.Context, platform vehicle.Platform, rawURL 
 		return rows[0], fmt.Errorf("listing details are unavailable")
 	}
 	return rows[0], nil
+}
+
+// EnrichListings is the source adapter used by durable workers for selected new/changed items.
+func EnrichListings(ctx context.Context, rows []vehicle.NormalizedVehicleListing) {
+	enrichListings(ctx, NewSharedClient(), rows)
+}
+
+// MergeDetails preserves identity and summary facts absent from the detail response.
+func MergeDetails(row *vehicle.NormalizedVehicleListing, facts vehicle.NormalizedVehicleListing) {
+	mergeDetails(row, facts)
+}
+
+// FetchListingFacts preserves typed upstream status codes for lifecycle verification.
+func FetchListingFacts(ctx context.Context, platform vehicle.Platform, rawURL string) (vehicle.NormalizedVehicleListing, error) {
+	return listingDetails(ctx, NewSharedClient(), platform, rawURL)
 }

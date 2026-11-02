@@ -13,8 +13,12 @@ import (
 func TestContinuationBoundToSearch(t *testing.T) {
 	c := vehicle.SearchCriteria{Type: vehicle.VehicleTypeCar, CitySlug: "tehran", Query: "206", BamaCategory: "peugeot-206ir"}
 	token := encodeCursor(vehicle.PlatformBama, c, 2, bamaContinuation{Vehicle: "peugeot,206ir", Index: 1})
-	if _, e := decodeCursor(token, vehicle.PlatformBama, c); e != nil {
+	cursor, e := decodeCursor(token, vehicle.PlatformBama, c)
+	if e != nil {
 		t.Fatal(e)
+	}
+	if !time.Unix(cursor.Expires, 0).After(time.Now().Add(24 * time.Hour)) {
+		t.Fatal("continuation expires before the cached source page")
 	}
 	changed := c
 	changed.CitySlug = "karaj"

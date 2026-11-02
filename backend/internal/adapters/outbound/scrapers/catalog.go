@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"golang.org/x/net/html"
 )
@@ -34,7 +35,15 @@ func NewCategoryCatalog(client *SharedClient) *CategoryCatalog {
 
 // Categories reads the actual brand/model links published by the marketplace.
 // The IDs are provider slugs, rather than aliases guessed from free-text input.
-func (c *CategoryCatalog) Categories(ctx context.Context, kind vehicle.VehicleType, parent string) ([]vehicle.Category, error) {
+func (c *CategoryCatalog) Categories(ctx context.Context, kind vehicle.VehicleType, parent string) (result []vehicle.Category, resultErr error) {
+	ctx, finish := observer.Start(ctx, "catalog", vehicle.PlatformBama)
+	cacheState := "miss"
+	defer func() {
+		if resultErr != nil && ports.FailureKind(resultErr) == "other" {
+			resultErr = &ports.SourceError{Kind: "catalog", Err: resultErr}
+		}
+		finish(ports.Observation{Cache: cacheState, Error: resultErr})
+	}()
 	if kind != vehicle.VehicleTypeCar && kind != vehicle.VehicleTypeMotorcycle {
 		return nil, fmt.Errorf("choose a vehicle type")
 	}
@@ -46,6 +55,7 @@ func (c *CategoryCatalog) Categories(ctx context.Context, kind vehicle.VehicleTy
 	entry, ok := c.cache[key]
 	c.mu.Unlock()
 	if ok && time.Now().Before(entry.expires) {
+		cacheState = "hit"
 		return entry.rows, nil
 	}
 	root := "/car/"

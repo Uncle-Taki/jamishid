@@ -1,0 +1,99 @@
+{
+  "version": "vehicle-text-v1",
+  "tokenAliases": {
+    "benelli": "بنلی",
+    "peugeot": "پژو",
+    "honda": "هوندا",
+    "yamaha": "یاماها",
+    "kia": "کیا",
+    "type": "تیپ",
+    "beneli": "بنلی"
+  },
+  "phraseAliases": {
+    "تی ان تی": "tnt"
+  },
+  "cases": [
+    {
+      "input": "كيا ١٨٠",
+      "text": "کیا 180",
+      "model": "کیا 180"
+    },
+    {
+      "input": "TNT180S",
+      "text": "tnt180s",
+      "model": "tnt 180 s"
+    },
+    {
+      "input": "TNT ۱۸۰ S",
+      "text": "tnt 180 s",
+      "model": "tnt 180 s"
+    },
+    {
+      "input": "Benelli TNT-180S",
+      "text": "benelli tnt 180s",
+      "model": "بنلی tnt 180 s"
+    },
+    {
+      "input": "بنلي تی ان تی ۱۸۰s",
+      "text": "بنلی تی ان تی 180s",
+      "model": "بنلی tnt 180 s"
+    },
+    {
+      "input": "Peugeot ۲۰۶ type ۵",
+      "text": "peugeot 206 type 5",
+      "model": "پژو 206 تیپ 5"
+    },
+    {
+      "input": "پژو۲۰۶ تیپ۵",
+      "text": "پژو206 تیپ5",
+      "model": "پژو 206 تیپ 5"
+    },
+    {
+      "input": "جم‌ شید",
+      "text": "جم شید",
+      "model": "جم شید"
+    },
+    {
+      "input": "کِیا‏ ۱۸۰",
+      "text": "کیا 180",
+      "model": "کیا 180"
+    },
+    {
+      "input": "۲۰۶۵",
+      "text": "2065",
+      "model": "2065"
+    },
+    {
+      "input": "TNT1800S",
+      "text": "tnt1800s",
+      "model": "tnt 1800 s"
+    },
+    {
+      "input": "Beneli TNT180S",
+      "text": "beneli tnt180s",
+      "model": "بنلی tnt 180 s"
+    }
+  ],
+  "distinct": [
+    [
+      "206",
+      "2065"
+    ],
+    [
+      "206 تیپ 2",
+      "206 تیپ 5"
+    ],
+    [
+      "TNT180S",
+      "TNT1800S"
+    ],
+    [
+      "TNT180",
+      "TNT180S"
+    ],
+    [
+      "Peugeot 206",
+      "Peugeot 207"
+    ]
+  ]
+}

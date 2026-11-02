@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"golang.org/x/net/html"
 )
@@ -35,7 +36,21 @@ var cursorKey = func() []byte {
 	}
 	return b
 }()
+
+// ConfigureCursorSigningKey is called at startup before requests can decode tokens.
+func ConfigureCursorSigningKey(key []byte) error {
+	if len(key) != 32 {
+		return fmt.Errorf("cursor signing key must contain 32 bytes")
+	}
+	cursorKey = append([]byte(nil), key...)
+	return nil
+}
+
 var ErrInvalidCursor = errors.New("pagination cursor does not match this search or has expired")
+
+// Continuations must remain usable when their source page is served from the
+// 24-hour cache. Allow another day to finish traversing that cached search.
+const cursorTTL = 48 * time.Hour
 
 func searchScope(platform vehicle.Platform, c vehicle.SearchCriteria) string {
 	raw, _ := json.Marshal([]string{string(platform), string(c.Type), c.CitySlug, c.Query, c.BamaCategory, c.Keywords})
@@ -44,7 +59,7 @@ func searchScope(platform vehicle.Platform, c vehicle.SearchCriteria) string {
 }
 func encodeCursor(platform vehicle.Platform, c vehicle.SearchCriteria, page int, data any) string {
 	payload, _ := json.Marshal(data)
-	raw, _ := json.Marshal(pageCursor{Search: searchScope(platform, c), Page: page, Expires: time.Now().Add(2 * time.Hour).Unix(), Data: payload})
+	raw, _ := json.Marshal(pageCursor{Search: searchScope(platform, c), Page: page, Expires: time.Now().Add(cursorTTL).Unix(), Data: payload})
 	mac := hmac.New(sha256.New, cursorKey)
 	mac.Write(raw)
 	return base64.RawURLEncoding.EncodeToString(raw) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
@@ -74,14 +89,15 @@ func decodeCursor(token string, platform vehicle.Platform, c vehicle.SearchCrite
 	return out, nil
 }
 
-func PublicSearchPage(ctx context.Context, client *SharedClient, base string, platform vehicle.Platform, c vehicle.SearchCriteria, token string) (vehicle.ListingPage, error) {
-	var page vehicle.ListingPage
+func PublicSearchPage(ctx context.Context, client *SharedClient, base string, platform vehicle.Platform, c vehicle.SearchCriteria, token string) (page vehicle.ListingPage, resultErr error) {
+	ctx, finish := observer.Start(ctx, "page", platform)
+	defer func() { finish(ports.Observation{Error: resultErr, Listings: len(page.Listings)}) }()
 	var err error
 	cursor := pageCursor{Page: 1}
 	if token != "" {
 		cursor, err = decodeCursor(token, platform, c)
 		if err != nil {
-			return page, err
+			return page, &ports.SourceError{Kind: "cursor", Err: err}
 		}
 	}
 	switch platform {
@@ -95,7 +111,16 @@ func PublicSearchPage(ctx context.Context, client *SharedClient, base string, pl
 		return page, fmt.Errorf("unknown marketplace")
 	}
 	if err != nil {
+		if ports.FailureKind(err) == "other" {
+			err = &ports.SourceError{Kind: "parser", Err: err}
+		}
 		return page, err
+	}
+	if page.Parser.Valid == 0 && len(page.Listings) > 0 {
+		page.Listings, page.Parser, err = validateCollection(ctx, platform, len(page.Listings), page.Listings)
+		if err != nil {
+			return page, err
+		}
 	}
 	canonical := map[vehicle.Platform]string{vehicle.PlatformDivar: "divar.ir", vehicle.PlatformBama: "bama.ir", vehicle.PlatformSheypoor: "sheypoor.com"}[platform]
 	rows := make([]vehicle.NormalizedVehicleListing, 0, len(page.Listings))
@@ -121,7 +146,7 @@ func PublicSearchPage(ctx context.Context, client *SharedClient, base string, pl
 		rows = append(rows, l)
 	}
 	page.Listings = rows
-	if base == "https://divar.ir" || base == "https://bama.ir" || base == "https://www.sheypoor.com" {
+	if !ports.CrawlPolicyFrom(ctx).SkipDetails && (base == "https://divar.ir" || base == "https://bama.ir" || base == "https://www.sheypoor.com") {
 		enrichListings(ctx, client, page.Listings)
 	}
 	page.Page = cursor.Page
@@ -298,6 +323,7 @@ func divarSearchPage(ctx context.Context, client *SharedClient, base string, c v
 			if str(widget["widget_type"]) != "POST_ROW" {
 				continue
 			}
+			out.Parser.Candidates++
 			data := obj(widget["data"])
 			l := missingListing()
 			l.ID = str(data["token"])
@@ -323,6 +349,15 @@ func divarSearchPage(ctx context.Context, client *SharedClient, base string, c v
 		pagination := obj(response["pagination"])
 		next = obj(pagination["data"])
 		hasMore, _ = pagination["has_next_page"].(bool)
+	}
+	var contractErr error
+	candidates := out.Parser.Candidates
+	if candidates == 0 {
+		candidates = len(out.Listings)
+	}
+	out.Listings, out.Parser, contractErr = validateCollection(ctx, vehicle.PlatformDivar, candidates, out.Listings)
+	if contractErr != nil {
+		return out, contractErr
 	}
 	if hasMore && len(next) > 0 {
 		state.Pagination = next
@@ -452,6 +487,7 @@ func bamaSearchPage(ctx context.Context, client *SharedClient, base string, c ve
 		if !ok || response["status"] == false {
 			return out, fmt.Errorf("Bama continuation has no listing collection")
 		}
+		out.Parser.Candidates = len(ads)
 		for _, ad := range ads {
 			a := obj(ad)
 			d := obj(a["detail"])
@@ -461,6 +497,8 @@ func bamaSearchPage(ctx context.Context, client *SharedClient, base string, c ve
 			l := missingListing()
 			l.ID = str(d["code"])
 			l.Title = str(d["title"]) + " " + str(d["trim"])
+			l.BrandModel = str(d["title"])
+			l.TrimName = str(d["trim"])
 			l.URL = "https://bama.ir" + str(d["url"])
 			l.PriceToman = number(obj(a["price"])["price"])
 			l.Year = int(number(d["year"]))
@@ -483,6 +521,15 @@ func bamaSearchPage(ctx context.Context, client *SharedClient, base string, c ve
 		}
 		hasMore, _ = obj(response["metadata"])["has_next"].(bool)
 		state.Index++
+	}
+	var contractErr error
+	candidates := out.Parser.Candidates
+	if candidates == 0 {
+		candidates = len(out.Listings)
+	}
+	out.Listings, out.Parser, contractErr = validateCollection(ctx, vehicle.PlatformBama, candidates, out.Listings)
+	if contractErr != nil {
+		return out, contractErr
 	}
 	// Free text searches within the chosen brand/model; never infer another brand
 	// or reject English brand aliases by comparing them with Persian titles.
@@ -567,6 +614,7 @@ func sheypoorSearchPage(ctx context.Context, client *SharedClient, base string, 
 	if !ok {
 		return out, fmt.Errorf("Sheypoor response has no listing collection")
 	}
+	out.Parser.Candidates = len(ads)
 	for _, ad := range ads {
 		a := obj(ad)
 		d := obj(a["attributes"])
@@ -594,6 +642,11 @@ func sheypoorSearchPage(ctx context.Context, client *SharedClient, base string, 
 			applyAttribute(&l, key, value)
 		}
 		out.Listings = append(out.Listings, l)
+	}
+	var contractErr error
+	out.Listings, out.Parser, contractErr = validateCollection(ctx, vehicle.PlatformSheypoor, len(ads), out.Listings)
+	if contractErr != nil {
+		return out, contractErr
 	}
 	meta := obj(response["meta"])
 	filter := str(meta["f"])

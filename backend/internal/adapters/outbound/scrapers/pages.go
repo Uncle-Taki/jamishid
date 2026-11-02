@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"golang.org/x/net/html"
@@ -123,23 +122,7 @@ func PublicPage(ctx context.Context, client *SharedClient, base string, platform
 	return result, nil
 }
 
-func searchText(s string) string {
-	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
-		if d, ok := persianDigitMap[r]; ok {
-			return d
-		}
-		if r == 'ي' {
-			return 'ی'
-		}
-		if r == 'ك' {
-			return 'ک'
-		}
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			return unicode.ToLower(r)
-		}
-		return ' '
-	}, s)), " ")
-}
+func searchText(s string) string { return vehicle.NormalizeSearchText(s) }
 
 func bamaBrand(query string) (string, error) {
 	q := searchText(query)
@@ -200,6 +183,7 @@ func missingListing() vehicle.NormalizedVehicleListing {
 func divarPage(doc *html.Node) ([]vehicle.NormalizedVehicleListing, error) {
 	out := []vehicle.NormalizedVehicleListing{}
 	recognized := false
+	explicitEmpty := false
 	walk(doc, func(n *html.Node) {
 		if n.Data != "script" || attr(n, "type") != "application/ld+json" || n.FirstChild == nil {
 			return
@@ -213,6 +197,9 @@ func divarPage(doc *html.Node) ([]vehicle.NormalizedVehicleListing, error) {
 			return
 		}
 		recognized = true
+		if len(values) == 0 {
+			explicitEmpty = true
+		}
 		for _, value := range values {
 			m := obj(value)
 			kind := str(m["@type"])
@@ -251,7 +238,7 @@ func divarPage(doc *html.Node) ([]vehicle.NormalizedVehicleListing, error) {
 			out = append(out, l)
 		}
 	})
-	if !recognized {
+	if !recognized || (len(out) == 0 && !explicitEmpty) {
 		return nil, fmt.Errorf("Divar search page contains no recognized listing data")
 	}
 	return out, nil
@@ -277,8 +264,14 @@ func bamaPage(doc *html.Node) ([]vehicle.NormalizedVehicleListing, error) {
 	}
 	get := func(m map[string]any, k string) any { return resolve(m[k]) }
 	out := []vehicle.NormalizedVehicleListing{}
+	explicitEmpty := false
 	for _, v := range table {
 		m := obj(v)
+		if m["ads"] != nil {
+			if ads, ok := get(m, "ads").([]any); ok && len(ads) == 0 {
+				explicitEmpty = true
+			}
+		}
 		if m["code"] == nil || m["mileage"] == nil || m["price"] == nil {
 			continue
 		}
@@ -300,6 +293,9 @@ func bamaPage(doc *html.Node) ([]vehicle.NormalizedVehicleListing, error) {
 		l.FuelType = str(get(m, "fuel"))
 		l.PublishedAt = ListingTime(str(get(m, "time")), time.Now())
 		out = append(out, l)
+	}
+	if len(out) == 0 && !explicitEmpty {
+		return nil, fmt.Errorf("Bama state has no listing records or explicit empty collection")
 	}
 	return out, nil
 }

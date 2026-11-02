@@ -54,7 +54,7 @@ func TestExplicitEmptyResults(t *testing.T) {
 		parse      func(*html.Node) ([]vehicle.NormalizedVehicleListing, error)
 	}{
 		{"divar", `<script type="application/ld+json">[]</script>`, divarPage},
-		{"bama", `<script id="__NUXT_DATA__">[{}]</script>`, bamaPage},
+		{"bama", `<script id="__NUXT_DATA__">[{"ads":1},[]]</script>`, bamaPage},
 		{"sheypoor", `<p>آگهی یافت نشد</p>`, sheypoorPage},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,6 +62,23 @@ func TestExplicitEmptyResults(t *testing.T) {
 			rows, err := tc.parse(doc)
 			if err != nil || len(rows) != 0 {
 				t.Fatalf("rows=%v err=%v", rows, err)
+			}
+		})
+	}
+}
+
+func TestRecognizedShellsWithoutListingSchemaAreNotEmptyInventory(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		parse      func(*html.Node) ([]vehicle.NormalizedVehicleListing, error)
+	}{
+		{"bama", `<script id="__NUXT_DATA__">[{"renamed_ads":1},[]]</script>`, bamaPage},
+		{"divar", `<script type="application/ld+json">[{"@type":"Organization","name":"Website"}]</script>`, divarPage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, _ := html.Parse(strings.NewReader(tc.body))
+			if rows, err := tc.parse(doc); err == nil {
+				t.Fatalf("schema shell silently accepted as empty: %+v", rows)
 			}
 		})
 	}

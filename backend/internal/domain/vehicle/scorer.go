@@ -151,12 +151,14 @@ func CalculateYearScore(year, minYear, maxYear int) float64 {
 // GetDealTierLabels returns localized labels and UI badge classes for a given tier
 func GetDealTierLabels(tier DealTier) (labelFa, labelEn, bg, text, border string) {
 	switch tier {
+	case DealTierInsufficient:
+		return "شواهد مقایسه محدود", "Limited comparison evidence", "bg-slate-800", "text-slate-300", "border-slate-700"
 	case DealTierSuper:
 		return "فرصت طلایی خرید", "Super Deal 🏆", "bg-emerald-500/20", "text-emerald-300", "border-emerald-500/40"
 	case DealTierGood:
 		return "ارزش خرید بالا", "Good Deal ✨", "bg-blue-500/20", "text-blue-300", "border-blue-500/40"
 	case DealTierFair:
-		return "قیمت منصفانه بازار", "Fair Market ⚖️", "bg-slate-800", "text-slate-300", "border-slate-700"
+		return "امتیاز میانه در آگهی‌ها", "Fair Market ⚖️", "bg-slate-800", "text-slate-300", "border-slate-700"
 	case DealTierOverpriced:
 		return "ارزش خرید پایین / گران", "Overpriced / Risky ⚠️", "bg-rose-500/20", "text-rose-400", "border-rose-500/40"
 	default:

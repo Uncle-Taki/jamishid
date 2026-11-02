@@ -1,0 +1,229 @@
+{
+  "base": {
+    "id": "target",
+    "platform": "bama",
+    "title": "پژو 206 تیپ 5",
+    "brandModel": "پژو 206",
+    "trimName": "5",
+    "vehicleType": "car",
+    "priceToman": 85,
+    "mileageKm": 20000,
+    "year": 1402,
+    "bodyStatus": "perfect",
+    "cityId": "tehran",
+    "url": "https://bama.ir/car/target",
+    "scrapedAt": "2026-11-02T00:00:00Z"
+  },
+  "cases": [
+    {
+      "name": "strong local asking-price cohort",
+      "target": {},
+      "peer": {
+        "priceToman": 100
+      },
+      "count": 10,
+      "expected": {
+        "count": 10,
+        "confidence": 100,
+        "median": 100,
+        "total": 85
+      }
+    },
+    {
+      "name": "small sample lowers confidence without shrinking utility",
+      "target": {},
+      "peer": {
+        "priceToman": 100
+      },
+      "count": 3,
+      "expected": {
+        "count": 3,
+        "confidence": 30,
+        "median": 100,
+        "total": 85
+      }
+    },
+    {
+      "name": "self only is not a benchmark",
+      "target": {},
+      "peer": {},
+      "count": 0,
+      "expected": {
+        "count": 0,
+        "confidence": 0,
+        "median": 0,
+        "total": 50
+      }
+    },
+    {
+      "name": "national fallback lowers confidence",
+      "target": {},
+      "peer": {
+        "priceToman": 100,
+        "cityId": "shiraz"
+      },
+      "count": 10,
+      "expected": {
+        "count": 10,
+        "confidence": 75,
+        "median": 100,
+        "total": 85
+      }
+    },
+    {
+      "name": "missing trim caps confidence",
+      "target": {
+        "trimName": ""
+      },
+      "peer": {
+        "trimName": "",
+        "priceToman": 100
+      },
+      "count": 10,
+      "expected": {
+        "count": 10,
+        "confidence": 65,
+        "median": 100,
+        "total": 85
+      }
+    },
+    {
+      "name": "different trim is excluded",
+      "target": {},
+      "peer": {
+        "trimName": "2",
+        "priceToman": 100
+      },
+      "count": 10,
+      "expected": {
+        "count": 0,
+        "confidence": 0,
+        "median": 0,
+        "total": 50
+      }
+    },
+    {
+      "name": "different type is excluded",
+      "target": {},
+      "peer": {
+        "vehicleType": "motorcycle",
+        "priceToman": 100
+      },
+      "count": 10,
+      "expected": {
+        "count": 0,
+        "confidence": 0,
+        "median": 0,
+        "total": 50
+      }
+    },
+    {
+      "name": "missing model cannot mix unrelated cars",
+      "target": {
+        "brandModel": ""
+      },
+      "peer": {
+        "priceToman": 100
+      },
+      "count": 10,
+      "expected": {
+        "count": 0,
+        "confidence": 0,
+        "median": 0,
+        "total": 50
+      }
+    },
+    {
+      "name": "Arabic letters and Persian digits match",
+      "target": {},
+      "peer": {
+        "brandModel": "پژو ۲۰۶",
+        "trimName": "۵",
+        "priceToman": 100
+      },
+      "count": 10,
+      "expected": {
+        "count": 10,
+        "confidence": 100,
+        "median": 100,
+        "total": 85
+      }
+    },
+    {
+      "name": "nearby Gregorian source years compare",
+      "target": {},
+      "peer": {
+        "priceToman": 100,
+        "year": 2023
+      },
+      "count": 10,
+      "expected": {
+        "count": 10,
+        "confidence": 100,
+        "median": 100,
+        "total": 85
+      }
+    },
+    {
+      "name": "older years excluded",
+      "target": {},
+      "peer": {
+        "priceToman": 100,
+        "year": 1398
+      },
+      "count": 10,
+      "expected": {
+        "count": 0,
+        "confidence": 0,
+        "median": 0,
+        "total": 50
+      }
+    },
+    {
+      "name": "incompatible mileage excluded",
+      "target": {},
+      "peer": {
+        "priceToman": 100,
+        "mileageKm": 100000
+      },
+      "count": 10,
+      "expected": {
+        "count": 0,
+        "confidence": 0,
+        "median": 0,
+        "total": 50
+      }
+    },
+    {
+      "name": "different condition excluded",
+      "target": {},
+      "peer": {
+        "priceToman": 100,
+        "bodyStatus": "chassis-hit"
+      },
+      "count": 10,
+      "expected": {
+        "count": 0,
+        "confidence": 0,
+        "median": 0,
+        "total": 50
+      }
+    },
+    {
+      "name": "unpriced target has no deal claim",
+      "target": {
+        "priceToman": 0
+      },
+      "peer": {
+        "priceToman": 100
+      },
+      "count": 10,
+      "expected": {
+        "count": 10,
+        "confidence": 0,
+        "median": 100,
+        "total": 50
+      }
+    }
+  ]
+}

@@ -10,7 +10,7 @@ import (
 var vehicleWords = regexp.MustCompile(`[\p{L}]+|[0-9]+`)
 
 func titleWords(text string) []string {
-	return vehicleWords.FindAllString(searchText(text), -1)
+	return vehicleWords.FindAllString(vehicle.NormalizeModelText(text), -1)
 }
 
 func containsWords(title, words []string) bool {

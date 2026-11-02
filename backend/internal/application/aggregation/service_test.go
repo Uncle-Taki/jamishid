@@ -3,9 +3,11 @@ package aggregation
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/adapters/outbound/memory"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 )
@@ -15,9 +17,11 @@ type mockScraper struct {
 	delay    time.Duration
 	result   []vehicle.NormalizedVehicleListing
 	err      error
+	calls    atomic.Int32
 }
 
 func (m *mockScraper) Scrape(ctx context.Context, criteria vehicle.SearchCriteria) ([]vehicle.NormalizedVehicleListing, error) {
+	m.calls.Add(1)
 	if m.delay > 0 {
 		select {
 		case <-time.After(m.delay):
@@ -32,25 +36,8 @@ func (m *mockScraper) Platform() vehicle.Platform {
 	return m.platform
 }
 
-type mockCache struct {
-	data map[string][]vehicle.ScoredListing
-}
-
-func (m *mockCache) Get(ctx context.Context, key string) ([]vehicle.ScoredListing, bool) {
-	val, ok := m.data[key]
-	return val, ok
-}
-
-func (m *mockCache) Set(ctx context.Context, key string, listings []vehicle.ScoredListing) error {
-	if m.data == nil {
-		m.data = make(map[string][]vehicle.ScoredListing)
-	}
-	m.data[key] = listings
-	return nil
-}
-
 func TestAggregationService_AggregateListings(t *testing.T) {
-	cache := &mockCache{}
+	cache := memory.NewCache(24 * time.Hour)
 	weights := vehicle.ScoreWeights{
 		PriceWeight:     40,
 		ConditionWeight: 30,
@@ -101,9 +88,18 @@ func TestAggregationService_AggregateListings(t *testing.T) {
 		t.Errorf("expected 2 results (1 failure ignored), got %d", len(results))
 	}
 
-	key := generateCacheKey(criteria)
-	if _, found := cache.Get(ctx, key); found {
-		t.Errorf("partial failures must not be cached")
+	if _, err := svc.AggregateListings(ctx, criteria); err != nil {
+		t.Fatal(err)
+	}
+	for _, scraper := range import_ports_scrapers {
+		mock := scraper.(*mockScraper)
+		want := int32(1)
+		if mock.err != nil {
+			want = 2
+		}
+		if mock.calls.Load() != want {
+			t.Errorf("source %s fetched %d times, want %d; failures must retry, successes must be reused", mock.platform, mock.calls.Load(), want)
+		}
 	}
 
 	if len(results) == 2 {
@@ -114,7 +110,7 @@ func TestAggregationService_AggregateListings(t *testing.T) {
 }
 
 func TestAggregationService_DateCutoff(t *testing.T) {
-	cache := &mockCache{}
+	cache := memory.NewCache(24 * time.Hour)
 	weights := vehicle.ScoreWeights{PriceWeight: 100}
 
 	nowStr := time.Now().Format(time.RFC3339)
@@ -144,7 +140,7 @@ func TestAggregationService_DateCutoff(t *testing.T) {
 }
 
 func TestAllSourcesFailedIsAnError(t *testing.T) {
-	svc := NewAggregationService([]ports.MarketplaceScraper{&mockScraper{platform: vehicle.PlatformDivar, err: errors.New("blocked")}}, &mockCache{}, vehicle.ScoreWeights{})
+	svc := NewAggregationService([]ports.MarketplaceScraper{&mockScraper{platform: vehicle.PlatformDivar, err: errors.New("blocked")}}, memory.NewCache(24*time.Hour), vehicle.ScoreWeights{})
 	result, err := svc.AggregateWithSources(context.Background(), vehicle.SearchCriteria{Query: "206"})
 	if !errors.Is(err, ErrSourcesUnavailable) || len(result.Listings) != 0 || len(result.Sources) != 1 || result.Sources[0].Status != "unavailable" {
 		t.Fatalf("result=%+v error=%v", result, err)
@@ -154,7 +150,7 @@ func TestAllSourcesFailedIsAnError(t *testing.T) {
 func TestPartialSourcesReportFailureAndRespectPlatform(t *testing.T) {
 	divar := &mockScraper{platform: vehicle.PlatformDivar, result: []vehicle.NormalizedVehicleListing{{ID: "real", Platform: vehicle.PlatformDivar, PriceToman: 500}}}
 	bama := &mockScraper{platform: vehicle.PlatformBama, err: errors.New("blocked")}
-	svc := NewAggregationService([]ports.MarketplaceScraper{divar, bama}, &mockCache{}, vehicle.ScoreWeights{PriceWeight: 100})
+	svc := NewAggregationService([]ports.MarketplaceScraper{divar, bama}, memory.NewCache(24*time.Hour), vehicle.ScoreWeights{PriceWeight: 100})
 	result, err := svc.AggregateWithSources(context.Background(), vehicle.SearchCriteria{Query: "206"})
 	if err != nil || len(result.Listings) != 1 || result.Sources[1].Status != "unavailable" {
 		t.Fatalf("result=%+v error=%v", result, err)

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"golang.org/x/net/html"
 )
@@ -83,7 +84,15 @@ func (c *ProviderCatalog) LoadSnapshot(path string) error {
 	return nil
 }
 
-func (c *ProviderCatalog) Categories(ctx context.Context, platform vehicle.Platform, kind vehicle.VehicleType, parent string) ([]vehicle.Category, error) {
+func (c *ProviderCatalog) Categories(ctx context.Context, platform vehicle.Platform, kind vehicle.VehicleType, parent string) (result []vehicle.Category, resultErr error) {
+	ctx, finish := observer.Start(ctx, "catalog", platform)
+	cacheState := "miss"
+	defer func() {
+		if resultErr != nil && ports.FailureKind(resultErr) == "other" {
+			resultErr = &ports.SourceError{Kind: "catalog", Err: resultErr}
+		}
+		finish(ports.Observation{Cache: cacheState, Error: resultErr})
+	}()
 	if kind != vehicle.VehicleTypeCar && kind != vehicle.VehicleTypeMotorcycle {
 		return nil, fmt.Errorf("invalid vehicle type")
 	}
@@ -96,6 +105,7 @@ func (c *ProviderCatalog) Categories(ctx context.Context, platform vehicle.Platf
 	entry, cached := c.cache[key]
 	c.mu.Unlock()
 	if cached && time.Now().Before(entry.expires) {
+		cacheState = "hit"
 		return entry.rows, nil
 	}
 	if platform == vehicle.PlatformBama {

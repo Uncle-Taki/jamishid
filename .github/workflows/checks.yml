@@ -1,0 +1,34 @@
+name: Backend release checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: jamshid
+          POSTGRES_PASSWORD: jamshid-test
+          POSTGRES_DB: jamshid_test
+        ports: ['5432:5432']
+        options: --health-cmd="pg_isready -U jamshid -d jamshid_test" --health-interval=5s --health-timeout=3s --health-retries=10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      TEST_DATABASE_URL: postgres://jamshid:jamshid-test@localhost:5432/jamshid_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - run: go vet ./...
+      - run: make test
+      - run: go build ./cmd/api ./cmd/sourcecheck
+      - name: Restore the verified inventory snapshot into an isolated database
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: python3 ops/recovery.py --container "$POSTGRES_CONTAINER" --database jamshid_test --directory recovery-artifacts

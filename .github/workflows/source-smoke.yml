@@ -1,0 +1,25 @@
+name: Source schema smoke checks
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Run bounded source probes
+        working-directory: backend
+        run: go run ./cmd/sourcecheck > source-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-report
+          path: backend/source-report.json
