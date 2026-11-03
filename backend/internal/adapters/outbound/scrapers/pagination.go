@@ -53,7 +53,12 @@ var ErrInvalidCursor = errors.New("pagination cursor does not match this search 
 const cursorTTL = 48 * time.Hour
 
 func searchScope(platform vehicle.Platform, c vehicle.SearchCriteria) string {
-	raw, _ := json.Marshal([]string{string(platform), string(c.Type), c.CitySlug, c.Query, c.BamaCategory, c.Keywords})
+	scope := []string{string(platform), string(c.Type), c.CitySlug, c.Query, c.BamaCategory, c.Keywords}
+	// Preserve signed continuation scopes created before native coverage partitions existed.
+	if c.NativeCategory != "" {
+		scope = append(scope, c.NativeCategory)
+	}
+	raw, _ := json.Marshal(scope)
 	sum := sha256.Sum256(raw)
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
@@ -126,6 +131,16 @@ func PublicSearchPage(ctx context.Context, client *SharedClient, base string, pl
 	rows := make([]vehicle.NormalizedVehicleListing, 0, len(page.Listings))
 	seen := map[string]bool{}
 	for _, l := range page.Listings {
+		if platform == vehicle.PlatformBama {
+			l.CityID = vehicle.CityFromLocation(l.NeighborhoodFa)
+			if citySlug(c) != "iran" && l.CityID != citySlug(c) {
+				continue
+			}
+		} else if citySlug(c) == "iran" {
+			l.CityID = vehicle.CityFromLocation(l.NeighborhoodFa)
+		} else {
+			l.CityID = citySlug(c)
+		}
 		// These providers may broaden text searches to other models or recommendations.
 		// Keep continuation state even when every listing on this page is rejected.
 		if platform != vehicle.PlatformBama && !page.CategoryMatched && c.BamaCategory != "" && !matchesSelectedVehicle(l.Title, c) {
@@ -141,7 +156,6 @@ func PublicSearchPage(ctx context.Context, client *SharedClient, base string, pl
 		}
 		l.Platform = platform
 		l.VehicleType = c.Type
-		l.CityID = c.CitySlug
 		l.ScrapedAt = time.Now().UTC().Format(time.RFC3339)
 		rows = append(rows, l)
 	}
@@ -190,7 +204,13 @@ func divarSearchPage(ctx context.Context, client *SharedClient, base string, c v
 	if !more {
 		path := categoryPath(c)
 		query := c.Query
-		if c.BamaCategory != "" && base == "https://divar.ir" {
+		if c.NativeCategory != "" {
+			if !nativeCategoryPath.MatchString(c.NativeCategory) {
+				return out, ErrInvalidCursor
+			}
+			path += "/" + c.NativeCategory
+			state.NativeExact = true
+		} else if c.BamaCategory != "" && base == "https://divar.ir" {
 			native, err := searchCatalog.Resolve(ctx, vehicle.PlatformDivar, c)
 			if err != nil {
 				return out, fmt.Errorf("Divar category resolution: %w", err)
@@ -373,6 +393,10 @@ type bamaContinuation struct {
 
 func bamaSearchPage(ctx context.Context, client *SharedClient, base string, c vehicle.SearchCriteria, cursor pageCursor, more bool) (vehicle.ListingPage, error) {
 	out := vehicle.ListingPage{}
+	regionRoute, regionAPI, err := bamaRegion(citySlug(c))
+	if err != nil {
+		return out, err
+	}
 	state := bamaContinuation{}
 	root := "/car"
 	api := "/cad/api/search"
@@ -382,7 +406,10 @@ func bamaSearchPage(ctx context.Context, client *SharedClient, base string, c ve
 	}
 	hasMore := false
 	if !more {
-		slug := c.BamaCategory
+		slug := c.NativeCategory
+		if slug == "" {
+			slug = c.BamaCategory
+		}
 		if slug == "" {
 			var err error
 			slug, err = bamaBrand(c.Query)
@@ -394,8 +421,8 @@ func bamaSearchPage(ctx context.Context, client *SharedClient, base string, c ve
 			return out, fmt.Errorf("invalid marketplace category")
 		}
 		searchURL := strings.TrimRight(base, "/") + root + "/" + slug
-		if citySlug(c) != "iran" {
-			searchURL += "?region=" + url.QueryEscape(citySlug(c))
+		if regionRoute != "" {
+			searchURL += "?region=" + url.QueryEscape(regionRoute)
 		}
 		body, err := client.Fetch(ctx, "GET", searchURL, "")
 		if err != nil {
@@ -455,7 +482,7 @@ func bamaSearchPage(ctx context.Context, client *SharedClient, base string, c ve
 				hasMore, _ = resolve(m["has_next"], 0).(bool)
 			}
 		}
-		if state.Vehicle == "" && c.BamaCategory != "" {
+		if state.Vehicle == "" && (c.BamaCategory != "" || c.NativeCategory != "") {
 			return out, fmt.Errorf("Bama did not recognize the selected category")
 		}
 		state.Index = 1
@@ -471,8 +498,8 @@ func bamaSearchPage(ctx context.Context, client *SharedClient, base string, c ve
 			return out, ErrInvalidCursor
 		}
 		q := url.Values{"vehicle": {state.Vehicle}, "pageIndex": {strconv.Itoa(state.Index)}, "pageSize": {"12"}}
-		if citySlug(c) != "iran" {
-			q.Set("region", citySlug(c))
+		if regionAPI != "" {
+			q.Set("region", regionAPI)
 		}
 		body, err := client.Fetch(ctx, "GET", strings.TrimRight(base, "/")+api+"?"+q.Encode(), "")
 		if err != nil {
@@ -584,9 +611,12 @@ func sheypoorSearchPage(ctx context.Context, client *SharedClient, base string, 
 	}
 	category := categoryPath(c)
 	query := c.Query
-	if state.Category != "" || (c.BamaCategory != "" && base == "https://www.sheypoor.com") {
+	if state.Category != "" || c.NativeCategory != "" || (c.BamaCategory != "" && base == "https://www.sheypoor.com") {
 		if !more {
-			native, err := searchCatalog.Resolve(ctx, vehicle.PlatformSheypoor, c)
+			native, err := c.NativeCategory, error(nil)
+			if native == "" {
+				native, err = searchCatalog.Resolve(ctx, vehicle.PlatformSheypoor, c)
+			}
 			if err != nil {
 				return out, fmt.Errorf("Sheypoor category resolution: %w", err)
 			}

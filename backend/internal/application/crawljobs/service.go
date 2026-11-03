@@ -27,6 +27,8 @@ type Observation struct {
 	NeedsDetails bool
 }
 type Job struct {
+	RetryAt        *time.Time                         `json:"retryAt,omitempty"`
+	RetriesPending int                                `json:"retriesPending,omitempty"`
 	CrawlDone      bool                               `json:"crawlDone"`
 	DetailsPending int                                `json:"detailsPending"`
 	DetailsFailed  int                                `json:"detailsFailed"`
@@ -44,16 +46,20 @@ type Job struct {
 	Changed        int                                `json:"changedCount"`
 }
 type InventoryQuery struct {
-	Text, City, Category, Type, Platform, Body, Sort string
-	MinPrice, MaxPrice, MinMileage, MaxMileage       *float64
-	MinYear, MaxYear                                 *int
-	Limit, Offset                                    int
+	Text, Model, City, Category, Type, Platform, Body, Sort string
+	MinPrice, MaxPrice, MinMileage, MaxMileage              *float64
+	MinYear, MaxYear                                        *int
+	Limit, Offset                                           int
 }
 type InventoryResult struct {
 	Data   []vehicle.NormalizedVehicleListing `json:"data"`
 	Total  int                                `json:"total"`
 	Limit  int                                `json:"limit"`
 	Offset int                                `json:"offset"`
+}
+type InventoryCache interface {
+	GetInventory(context.Context, string) (InventoryResult, bool)
+	SetInventory(context.Context, string, InventoryResult)
 }
 type Repository interface {
 	Submit(context.Context, vehicle.SearchCriteria, bool) (Job, error)

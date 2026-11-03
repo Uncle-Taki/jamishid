@@ -158,7 +158,7 @@ func TestDurableInventoryWorkflow(t *testing.T) {
 	if err != nil || foreign.Total != 0 {
 		t.Fatalf("city filter: %+v %v", foreign, err)
 	}
-	exec("UPDATE listings SET details_at=now()-interval '25 hours'")
+	exec("UPDATE listings SET details_at=now()-interval '49 hours'")
 	stale, err := s.Prepare(ctx, []vehicle.NormalizedVehicleListing{row})
 	if err != nil || !stale[0].NeedsDetails {
 		t.Fatalf("stale detail not refreshed: %v", err)
@@ -167,12 +167,19 @@ func TestDurableInventoryWorkflow(t *testing.T) {
 	if err = s.Pool.QueryRow(ctx, "SELECT count(*) FROM listing_observations").Scan(&observationCount); err != nil || observationCount != 2 {
 		t.Fatalf("observations duplicated: %d %v", observationCount, err)
 	}
-	// A due popular search gets a shallow refresh, then a full refresh after 24 hours.
+	// Repeated searches reuse persisted results for five minutes rather than crawling again.
+	exec("UPDATE crawl_jobs SET updated_at=now()-interval '4 minutes' WHERE id=$1", job.ID)
+	reused, err := s.Submit(ctx, criteria, false)
+	if err != nil || reused.ID != job.ID {
+		t.Fatalf("recent stored job not reused: %+v %v", reused, err)
+	}
+	// Demand refreshes are bounded; baseline coverage runs full scans every 48 hours.
 	exec("UPDATE crawl_searches SET next_refresh=now()-interval '1 second',demand=12,demand_updated_at=now()")
 	if err = s.Schedule(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for page := 1; page <= 3; page++ {
+	for page := 1; page <= 20; page++ {
+		exec("UPDATE crawl_tasks SET available_at=now()")
 		task, ok, err = s.Claim(ctx)
 		if err != nil || !ok || task.Mode != "incremental" {
 			t.Fatalf("incremental: %+v %v", task, err)
@@ -182,14 +189,14 @@ func TestDurableInventoryWorkflow(t *testing.T) {
 		}
 	}
 	var hours float64
-	if err = s.Pool.QueryRow(ctx, "SELECT extract(epoch FROM(next_refresh-now()))/3600 FROM crawl_searches").Scan(&hours); err != nil || hours < 0.9 || hours > 1.1 {
+	if err = s.Pool.QueryRow(ctx, "SELECT extract(epoch FROM(next_refresh-now()))/3600 FROM crawl_searches").Scan(&hours); err != nil || hours < 47.9 || hours > 48.1 {
 		t.Fatalf("popular interval: %f %v", hours, err)
 	}
 	limited, err := s.Get(ctx, task.JobID)
-	if err != nil || !limited.CrawlDone || limited.Sources[0].NextCursor != "more" {
+	if err != nil || limited.Status != "partial" || !limited.CrawlDone || limited.Sources[0].NextCursor != "more" {
 		t.Fatalf("incremental limit: %+v %v", limited, err)
 	}
-	exec("UPDATE crawl_searches SET next_refresh=now()-interval '1 second',last_full=now()-interval '25 hours'")
+	exec("UPDATE crawl_searches SET next_refresh=now()-interval '1 second',last_full=now()-interval '49 hours',coverage=true")
 	if err = s.Schedule(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +218,7 @@ func TestDurableInventoryWorkflow(t *testing.T) {
 		}
 	}
 	failed, err := s.Get(ctx, task.JobID)
-	if err != nil || failed.Status != "partial" || !failed.CrawlDone {
+	if err != nil || failed.RetriesPending != 1 || failed.RetryAt == nil || !failed.Done || failed.CrawlDone {
 		t.Fatalf("failed job: %+v %v", failed, err)
 	}
 }

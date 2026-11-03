@@ -129,7 +129,11 @@ func (s *SharedClient) Fetch(ctx context.Context, method, rawURL, body string) (
 			}
 			waitDone(ports.Observation{Error: err})
 			if err != nil {
-				return nil, err
+				var previous *ports.SourceError
+				if errors.As(last, &previous) && previous.StatusCode == 429 {
+					return nil, &ports.SourceError{Kind: "rate_limited", StatusCode: 429, Err: err}
+				}
+				return nil, &ports.SourceError{Kind: "source_wait", Err: err}
 			}
 		}
 		attemptCtx, finish := observer.Start(ctx, "fetch", platform)
@@ -158,6 +162,9 @@ func (s *SharedClient) Fetch(ctx context.Context, method, rawURL, body string) (
 			return data, nil
 		}
 		last = err
+		if status == 429 {
+			last = &ports.SourceError{Kind: "rate_limited", StatusCode: 429, Err: errors.New("source rate limit")}
+		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -180,7 +187,10 @@ func (s *SharedClient) Fetch(ctx context.Context, method, rawURL, body string) (
 		}
 		budget.Unlock()
 		if sharedBudget != nil && platform != "other" {
-			if err := sharedBudget.Backoff(ctx, string(platform), delay.Milliseconds()); err != nil {
+			backoffCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+			backoffErr := sharedBudget.Backoff(backoffCtx, string(platform), delay.Milliseconds())
+			cancel()
+			if err := backoffErr; err != nil {
 				return nil, &ports.SourceError{Kind: "budget_unavailable", Err: err}
 			}
 		}

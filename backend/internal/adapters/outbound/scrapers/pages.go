@@ -51,7 +51,15 @@ func PublicPage(ctx context.Context, client *SharedClient, base string, platform
 	q.Set("q", criteria.Query)
 	if platform == vehicle.PlatformBama {
 		q.Del("q")
-		q.Set("region", city)
+		route, _, regionErr := bamaRegion(city)
+		if regionErr != nil {
+			return nil, regionErr
+		}
+		if route != "" {
+			q.Set("region", route)
+		} else {
+			q.Del("region")
+		}
 	}
 	u.RawQuery = q.Encode()
 	body, err := client.Fetch(ctx, "GET", u.String(), "")
@@ -82,11 +90,8 @@ func PublicPage(ctx context.Context, client *SharedClient, base string, platform
 		// Bama has no public free-text search parameter. Its brand route and
 		// region filter narrow the page; filter remaining model/trim terms here.
 		if platform == vehicle.PlatformBama {
-			cityName := map[string]string{"tehran": "تهران", "karaj": "کرج", "mashhad": "مشهد", "isfahan": "اصفهان", "shiraz": "شیراز", "tabriz": "تبریز", "ahvaz": "اهواز", "qom": "قم", "rasht": "رشت"}[city]
-			if cityName == "" {
-				return nil, fmt.Errorf("Bama city is not supported")
-			}
-			if !strings.HasPrefix(searchText(l.NeighborhoodFa), searchText(cityName)) {
+			l.CityID = vehicle.CityFromLocation(l.NeighborhoodFa)
+			if city != "iran" && l.CityID != city {
 				continue
 			}
 			candidate := strings.ReplaceAll(searchText(l.Title), " ", "")
@@ -111,7 +116,13 @@ func PublicPage(ctx context.Context, client *SharedClient, base string, platform
 		seen[l.ID] = true
 		l.ID = string(platform) + "-" + l.ID
 		l.Platform = platform
-		l.CityID = city
+		if platform != vehicle.PlatformBama {
+			if city == "iran" {
+				l.CityID = vehicle.CityFromLocation(l.NeighborhoodFa)
+			} else {
+				l.CityID = city
+			}
+		}
 		l.VehicleType = criteria.Type
 		l.ScrapedAt = now
 		if l.VehicleType == "" {

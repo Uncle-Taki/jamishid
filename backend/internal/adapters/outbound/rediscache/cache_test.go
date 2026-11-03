@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/application/crawljobs"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"github.com/alicebob/miniredis/v2"
 )
@@ -206,5 +207,22 @@ func TestMalformedCacheIsRefetchedAndRedisOutageDoesNotFetch(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatal("Redis outage triggered uncoordinated fetch")
+	}
+}
+
+func TestInventoryCacheRevisionAndExpiry(t *testing.T) {
+	server, a, b := testCaches(t)
+	ctx := context.Background()
+	result := crawljobs.InventoryResult{Data: []vehicle.NormalizedVehicleListing{{ID: "persisted"}}, Total: 1, Limit: 50}
+	a.SetInventory(ctx, "revision-1:query", result)
+	if got, ok := b.GetInventory(ctx, "revision-1:query"); !ok || got.Data[0].ID != "persisted" {
+		t.Fatal("inventory not shared")
+	}
+	if _, ok := b.GetInventory(ctx, "revision-2:query"); ok {
+		t.Fatal("new revision reused stale inventory")
+	}
+	server.FastForward(2 * time.Minute)
+	if _, ok := b.GetInventory(ctx, "revision-1:query"); ok {
+		t.Fatal("inventory did not expire")
 	}
 }

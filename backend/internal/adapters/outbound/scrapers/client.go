@@ -2,16 +2,25 @@ package scrapers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	urlpkg "net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 )
+
+var egressPool ports.EgressPool
+
+func ConfigureEgressPool(pool ports.EgressPool) { egressPool = pool }
+
+var proxyTransports sync.Map
 
 type SharedClient struct {
 	client *http.Client
@@ -41,7 +50,36 @@ func (s *SharedClient) fetchOnce(ctx context.Context, method, url, body string) 
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := s.client.Do(req)
+	client := s.client
+	proxyID := ""
+	if egressPool != nil && sourceFor(url) != "other" {
+		var endpoint string
+		proxyID, endpoint, err = egressPool.AcquireEgress(ctx)
+		if err != nil {
+			return nil, &ports.SourceError{Kind: "egress_unavailable", Err: errors.New("egress pool unavailable")}
+		}
+		if endpoint != "" {
+			transport, ok := proxyTransports.Load(endpoint)
+			if !ok {
+				u, _ := urlpkg.Parse(endpoint)
+				t := http.DefaultTransport.(*http.Transport).Clone()
+				t.Proxy = http.ProxyURL(u)
+				transport, _ = proxyTransports.LoadOrStore(endpoint, t)
+			}
+			clone := *s.client
+			clone.Transport = transport.(*http.Transport)
+			client = &clone
+		}
+	}
+	resp, err := client.Do(req)
+	if proxyID != "" {
+		reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		_ = egressPool.ReportEgress(reportCtx, proxyID, err == nil)
+		cancel()
+		if err != nil {
+			return nil, &ports.SourceError{Kind: "network", Err: errors.New("outbound proxy request failed")}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

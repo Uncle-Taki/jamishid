@@ -21,7 +21,11 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-type Store struct{ Pool *pgxpool.Pool }
+type Store struct {
+	Pool           *pgxpool.Pool
+	InventoryCache crawljobs.InventoryCache
+	RetryDelay     time.Duration
+}
 
 func New(ctx context.Context, url string) (*Store, error) {
 	config, err := pgxpool.ParseConfig(url)
@@ -54,7 +58,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(686837411); CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY);`); err != nil {
 		return err
 	}
-	for version, name := range []string{"001_inventory_jobs.sql", "002_details_lifecycle.sql", "003_normalization.sql"} {
+	for version, name := range []string{"001_inventory_jobs.sql", "002_details_lifecycle.sql", "003_normalization.sql", "004_bama_city.sql", "005_coverage.sql", "006_delayed_retries.sql"} {
 		var exists bool
 		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, version+1).Scan(&exists); err != nil {
 			return err
@@ -69,6 +73,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 			}
 			if version+1 == 3 {
 				if err = reindexNormalization(ctx, tx); err != nil {
+					return err
+				}
+			}
+			if version+1 == 4 {
+				if err = repairBamaCities(ctx, tx); err != nil {
 					return err
 				}
 			}
@@ -105,6 +114,12 @@ func createJob(ctx context.Context, tx pgx.Tx, searchID, mode string, criteria v
 }
 
 func (s *Store) Submit(ctx context.Context, criteria vehicle.SearchCriteria, force bool) (crawljobs.Job, error) {
+	return s.submit(ctx, criteria, force, false)
+}
+func (s *Store) SubmitStatus(ctx context.Context, criteria vehicle.SearchCriteria, force bool) (crawljobs.Job, error) {
+	return s.submit(ctx, criteria, force, true)
+}
+func (s *Store) submit(ctx context.Context, criteria vehicle.SearchCriteria, force, statusOnly bool) (crawljobs.Job, error) {
 	searchID, criteria := crawljobs.SearchIdentity(criteria)
 	raw, _ := json.Marshal(criteria)
 	tx, err := s.Pool.Begin(ctx)
@@ -117,15 +132,18 @@ func (s *Store) Submit(ctx context.Context, criteria vehicle.SearchCriteria, for
 		return crawljobs.Job{}, err
 	}
 	var jobID string
-	err = tx.QueryRow(ctx, `SELECT id FROM crawl_jobs WHERE search_id=$1 AND (status IN ('queued','running','paused') OR ($2=false AND status IN ('complete','partial','failed') AND updated_at>now()-interval '15 minutes')) ORDER BY created_at DESC LIMIT 1`, searchID, force).Scan(&jobID)
+	err = tx.QueryRow(ctx, `SELECT id FROM crawl_jobs WHERE search_id=$1 AND (status IN ('queued','running','paused') OR ($2=false AND status IN ('complete','partial','failed') AND updated_at>now()-interval '5 minutes')) ORDER BY created_at DESC LIMIT 1`, searchID, force).Scan(&jobID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		jobID, err = createJob(ctx, tx, searchID, "full", criteria)
+		jobID, err = createJob(ctx, tx, searchID, "incremental", criteria)
 	}
 	if err != nil {
 		return crawljobs.Job{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return crawljobs.Job{}, err
+	}
+	if statusOnly {
+		return s.Status(ctx, jobID)
 	}
 	return s.Get(ctx, jobID)
 }
@@ -139,7 +157,7 @@ func (s *Store) Claim(ctx context.Context) (crawljobs.Task, bool, error) {
 	var task crawljobs.Task
 	var raw []byte
 	var jobID string
-	err = tx.QueryRow(ctx, `SELECT j.id FROM crawl_jobs j WHERE j.status IN ('queued','running') AND EXISTS(SELECT 1 FROM crawl_tasks t WHERE t.job_id=j.id AND ((t.status IN ('queued','retry') AND t.available_at<=now()) OR(t.status='running' AND t.lease_until<now()))) ORDER BY j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1`).Scan(&jobID)
+	err = tx.QueryRow(ctx, `SELECT j.id FROM crawl_jobs j WHERE j.status IN ('queued','running') AND EXISTS(SELECT 1 FROM crawl_tasks t WHERE t.job_id=j.id AND ((t.status IN ('queued','retry') AND t.available_at<=now()) OR(t.status='running' AND t.lease_until<now()))) ORDER BY (j.mode='incremental') DESC,j.updated_at,j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1`).Scan(&jobID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task, false, nil
 	}
@@ -177,7 +195,7 @@ func (s *Store) Prepare(ctx context.Context, rows []vehicle.NormalizedVehicleLis
 		var previousHash string
 		var raw []byte
 		var fresh bool
-		err := s.Pool.QueryRow(ctx, `SELECT summary_hash,data,coalesce(details_at>now()-interval '24 hours',false) FROM listings WHERE platform=$1 AND id=$2`, row.Platform, row.ID).Scan(&previousHash, &raw, &fresh)
+		err := s.Pool.QueryRow(ctx, `SELECT summary_hash,data,coalesce(details_at>now()-interval '48 hours',false) FROM listings WHERE platform=$1 AND id=$2`, row.Platform, row.ID).Scan(&previousHash, &raw, &fresh)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return nil, err
 		}
@@ -215,7 +233,7 @@ func lockTask(ctx context.Context, tx pgx.Tx, task crawljobs.Task) error {
 
 func finishJob(ctx context.Context, tx pgx.Tx, jobID string) error {
 	var pending, paused, failed int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FILTER(WHERE status IN ('queued','running','retry')),count(*) FILTER(WHERE status='paused'),count(*) FILTER(WHERE status='unavailable') FROM crawl_tasks WHERE job_id=$1`, jobID).Scan(&pending, &paused, &failed); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT count(*) FILTER(WHERE status IN ('queued','running','retry','delayed')),count(*) FILTER(WHERE status='paused'),count(*) FILTER(WHERE status IN ('unavailable','limited')) FROM crawl_tasks WHERE job_id=$1`, jobID).Scan(&pending, &paused, &failed); err != nil {
 		return err
 	}
 	status := "running"
@@ -240,7 +258,7 @@ func finishJob(ctx context.Context, tx pgx.Tx, jobID string) error {
 		return err
 	}
 	if status == "complete" || status == "partial" {
-		_, err := tx.Exec(ctx, `UPDATE crawl_searches s SET next_refresh=now()+make_interval(secs=>CASE WHEN s.demand*exp(-extract(epoch FROM(now()-s.demand_updated_at))/86400)>=10 THEN 3600 WHEN s.demand*exp(-extract(epoch FROM(now()-s.demand_updated_at))/86400)>=3 THEN 10800 ELSE 43200 END),last_full=CASE WHEN j.mode='full' AND $2='complete' AND NOT EXISTS(SELECT 1 FROM crawl_tasks t WHERE t.job_id=j.id AND t.status='limited') THEN now() ELSE last_full END FROM crawl_jobs j WHERE j.id=$1 AND s.id=j.search_id`, jobID, status)
+		_, err := tx.Exec(ctx, `UPDATE crawl_searches s SET next_refresh=CASE WHEN s.coverage AND $2='partial' THEN now()+interval '15 minutes' WHEN s.coverage THEN greatest(j.created_at+interval '48 hours',now()) ELSE now()+interval '48 hours' END,page_interval_seconds=CASE WHEN s.coverage AND $2='complete' THEN greatest(1,least(900,129600/greatest(1,(SELECT coalesce(sum(page),1)::int FROM crawl_tasks WHERE job_id=j.id)))) ELSE s.page_interval_seconds END,last_full=CASE WHEN j.mode='full' AND $2='complete' AND NOT EXISTS(SELECT 1 FROM crawl_tasks t WHERE t.job_id=j.id AND t.status='limited') THEN now() ELSE last_full END FROM crawl_jobs j WHERE j.id=$1 AND s.id=j.search_id`, jobID, status)
 		return err
 	}
 	return nil
@@ -252,6 +270,12 @@ func (s *Store) Commit(ctx context.Context, task crawljobs.Task, observations []
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// Acquire the cache revision before any listing lock, matching detail completion.
+	// Otherwise the statement trigger and a concurrent detail update could deadlock.
+	if _, err = tx.Exec(ctx, `SELECT id FROM inventory_revision WHERE id=true FOR UPDATE`); err != nil {
+		return err
+	}
+
 	if err = lockTask(ctx, tx, task); err != nil {
 		return err
 	}
@@ -259,7 +283,11 @@ func (s *Store) Commit(ctx context.Context, task crawljobs.Task, observations []
 	if _, err = tx.Exec(ctx, `SELECT id FROM crawl_jobs WHERE id=$1 FOR UPDATE`, task.JobID); err != nil {
 		return err
 	}
-	newCount, changedCount := 0, 0
+	newCount, changedCount, knownCount := 0, 0, 0
+	var overlapPages int
+	if err = tx.QueryRow(ctx, `SELECT overlap_pages FROM crawl_tasks WHERE job_id=$1 AND platform=$2`, task.JobID, task.Platform).Scan(&overlapPages); err != nil {
+		return err
+	}
 	if page <= task.Page {
 		page = task.Page + 1
 	}
@@ -272,7 +300,11 @@ func (s *Store) Commit(ctx context.Context, task crawljobs.Task, observations []
 		}
 		raw, _ := json.Marshal(row)
 		var oldHash string
-		err = tx.QueryRow(ctx, `SELECT summary_hash FROM listings WHERE platform=$1 AND id=$2`, row.Platform, row.ID).Scan(&oldHash)
+		var knownBefore bool
+		err = tx.QueryRow(ctx, `SELECT summary_hash,first_seen<(SELECT created_at FROM crawl_jobs WHERE id=$3) AND NOT EXISTS(SELECT 1 FROM listing_observations o WHERE o.job_id=$3 AND o.platform=$1 AND o.listing_id=$2) FROM listings WHERE platform=$1 AND id=$2`, row.Platform, row.ID, task.JobID).Scan(&oldHash, &knownBefore)
+		if knownBefore {
+			knownCount++
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			newCount++
 		} else if err != nil {
@@ -295,9 +327,14 @@ func (s *Store) Commit(ctx context.Context, task crawljobs.Task, observations []
 		}
 	}
 	state := "queued"
-	if next == "" {
+	if len(observations) >= 5 && knownCount*10 >= len(observations)*9 {
+		overlapPages++
+	} else {
+		overlapPages = 0
+	}
+	if next == "" || (task.Mode == "incremental" && overlapPages >= 2) {
 		state = "complete"
-	} else if (task.Mode == "incremental" && page >= 3) || page >= 100 {
+	} else if (task.Mode == "incremental" && page >= 20) || page >= 10000 {
 		state = "limited"
 	}
 	// A pause requested while this page was fetching takes effect after commit.
@@ -308,7 +345,7 @@ func (s *Store) Commit(ctx context.Context, task crawljobs.Task, observations []
 	if parent == "paused" && state == "queued" {
 		state = "paused"
 	}
-	if _, err = tx.Exec(ctx, `UPDATE crawl_tasks SET status=$3,cursor=$4,next_cursor=$4,page=$5,attempts=0,token=null,lease_until=null,error_kind='',available_at=now() WHERE job_id=$1 AND platform=$2`, task.JobID, task.Platform, state, next, page); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE crawl_tasks SET status=$3,cursor=$4,next_cursor=$4,page=$5,attempts=0,token=null,lease_until=null,error_kind='',overlap_pages=$6,available_at=now()+make_interval(secs=>CASE WHEN (SELECT coverage FROM crawl_searches WHERE id=$7) THEN (SELECT page_interval_seconds FROM crawl_searches WHERE id=$7) ELSE 1 END) WHERE job_id=$1 AND platform=$2`, task.JobID, task.Platform, state, next, page, overlapPages, task.SearchID); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE crawl_jobs SET new_count=new_count+$2,changed_count=changed_count+$3 WHERE id=$1`, task.JobID, newCount, changedCount); err != nil {
@@ -334,17 +371,27 @@ func (s *Store) Fail(ctx context.Context, task crawljobs.Task, kind string) erro
 	if err = tx.QueryRow(ctx, `SELECT status FROM crawl_jobs WHERE id=$1`, task.JobID).Scan(&parent); err != nil {
 		return err
 	}
-	if task.Attempts >= 3 || kind == "parser" || kind == "validation" || kind == "http_4xx" {
+	deferred := kind == "source_wait" || kind == "budget_unavailable" || kind == "egress_unavailable" || kind == "rate_limited"
+	if deferred {
+		task.Attempts = max(0, task.Attempts-1)
+	}
+	if (!deferred && task.Attempts >= 3) || kind == "parser" || kind == "validation" || kind == "http_4xx" {
 		state = "unavailable"
 	}
-	if parent == "paused" {
+	if state == "unavailable" && transientRetry(kind, 0) {
+		state = "delayed"
+		if err = s.enqueueRetry(ctx, tx, "page", string(task.Platform), task.JobID, "", kind); err != nil {
+			return err
+		}
+	}
+	if parent == "paused" && state != "delayed" {
 		state = "paused"
 	}
 	if kind == "cursor" {
 		task.Cursor = ""
 		task.Page = 0
 	}
-	if _, err = tx.Exec(ctx, `UPDATE crawl_tasks SET status=$3,error_kind=$4,token=null,lease_until=null,cursor=$5,page=$6,available_at=now()+make_interval(secs=>$7) WHERE job_id=$1 AND platform=$2`, task.JobID, task.Platform, state, kind, task.Cursor, task.Page, task.Attempts*10); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE crawl_tasks SET status=$3,error_kind=$4,token=null,lease_until=null,cursor=$5,page=$6,attempts=$8,available_at=now()+make_interval(secs=>$7) WHERE job_id=$1 AND platform=$2`, task.JobID, task.Platform, state, kind, task.Cursor, task.Page, max(10, task.Attempts*10), task.Attempts); err != nil {
 		return err
 	}
 	if err = finishJob(ctx, tx, task.JobID); err != nil {
@@ -354,6 +401,12 @@ func (s *Store) Fail(ctx context.Context, task crawljobs.Task, kind string) erro
 }
 
 func (s *Store) Get(ctx context.Context, jobID string) (crawljobs.Job, error) {
+	return s.get(ctx, jobID, true)
+}
+func (s *Store) Status(ctx context.Context, jobID string) (crawljobs.Job, error) {
+	return s.get(ctx, jobID, false)
+}
+func (s *Store) get(ctx context.Context, jobID string, includeData bool) (crawljobs.Job, error) {
 	job := crawljobs.Job{Data: []vehicle.NormalizedVehicleListing{}, Sources: []vehicle.SourceStatus{}}
 	var raw []byte
 	var searchID string
@@ -368,7 +421,7 @@ func (s *Store) Get(ctx context.Context, jobID string) (crawljobs.Job, error) {
 		return job, err
 	}
 	job.Done = job.Status == "complete" || job.Status == "partial" || job.Status == "paused" || job.Status == "failed"
-	tasks, err := s.Pool.Query(ctx, `SELECT t.platform,t.status,t.page,t.next_cursor,t.error_kind,(SELECT count(*) FROM search_listings m WHERE m.search_id=$2 AND m.platform=t.platform AND m.last_seen>now()-interval '7 days') FROM crawl_tasks t WHERE t.job_id=$1 ORDER BY t.platform`, jobID, searchID)
+	tasks, err := s.Pool.Query(ctx, `SELECT t.platform,t.status,t.page,t.next_cursor,t.error_kind,(SELECT count(*) FROM search_listings m JOIN listings l ON l.platform=m.platform AND l.id=m.listing_id WHERE m.search_id=$2 AND m.platform=t.platform AND m.last_seen>now()-interval '7 days' AND ($3='' OR $3='iran' OR l.platform<>'bama' OR l.city=$3)) FROM crawl_tasks t WHERE t.job_id=$1 ORDER BY t.platform`, jobID, searchID, job.Criteria.CitySlug)
 	if err != nil {
 		return job, err
 	}
@@ -386,7 +439,7 @@ func (s *Store) Get(ctx context.Context, jobID string) (crawljobs.Job, error) {
 		if source.NextCursor == "" && (status == "queued" || status == "running" || status == "paused" || status == "retry") {
 			source.NextCursor = "job:pending"
 		}
-		if status == "unavailable" || status == "retry" {
+		if status == "unavailable" || status == "retry" || status == "delayed" {
 			source.Status = "unavailable"
 		}
 		job.Sources = append(job.Sources, source)
@@ -395,37 +448,51 @@ func (s *Store) Get(ctx context.Context, jobID string) (crawljobs.Job, error) {
 	if err = tasks.Err(); err != nil {
 		return job, err
 	}
-	rows, err := s.Pool.Query(ctx, `SELECT listing_payload(l) FROM search_listings m JOIN listings l ON l.platform=m.platform AND l.id=m.listing_id WHERE m.search_id=$1 AND m.last_seen>now()-interval '7 days' ORDER BY m.last_seen DESC,l.platform,l.id LIMIT 5001`, searchID)
-	if err != nil {
-		return job, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var raw []byte
-		var row vehicle.NormalizedVehicleListing
-		if err = rows.Scan(&raw); err != nil {
+	if includeData {
+		rows, err := s.Pool.Query(ctx, `SELECT listing_payload(l) FROM search_listings m JOIN listings l ON l.platform=m.platform AND l.id=m.listing_id WHERE m.search_id=$1 AND m.last_seen>now()-interval '7 days' AND ($2='' OR $2='iran' OR l.platform<>'bama' OR l.city=$2) ORDER BY m.last_seen DESC,l.platform,l.id LIMIT 5001`, searchID, job.Criteria.CitySlug)
+		if err != nil {
 			return job, err
 		}
-		if err = json.Unmarshal(raw, &row); err != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			var row vehicle.NormalizedVehicleListing
+			if err = rows.Scan(&raw); err != nil {
+				return job, err
+			}
+			if err = json.Unmarshal(raw, &row); err != nil {
+				return job, err
+			}
+			job.Data = append(job.Data, row)
+		}
+		if len(job.Data) > 5000 {
+			job.Data = job.Data[:5000]
+			job.Truncated = true
+		}
+		if err = rows.Err(); err != nil {
 			return job, err
 		}
-		job.Data = append(job.Data, row)
+		rows.Close()
+
 	}
-	if len(job.Data) > 5000 {
-		job.Data = job.Data[:5000]
-		job.Truncated = true
-	}
-	if err = rows.Err(); err != nil {
-		return job, err
-	}
-	rows.Close()
 	if err = s.Pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE d.status IN ('queued','running','retry')),count(*) FILTER(WHERE d.status='failed') FROM job_details j JOIN detail_tasks d USING(platform,listing_id) WHERE j.job_id=$1`, jobID).Scan(&job.DetailsPending, &job.DetailsFailed); err != nil {
 		return job, err
 	}
 	job.CrawlDone = job.Done
+	var waitingPages, activePages int
+	if err = s.Pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE status='delayed'),count(*) FILTER(WHERE status IN ('queued','running','retry')) FROM crawl_tasks WHERE job_id=$1`, jobID).Scan(&waitingPages, &activePages); err != nil {
+		return job, err
+	}
+	if waitingPages > 0 && activePages == 0 {
+		job.Done = true
+	}
 	if job.Status != "paused" && job.DetailsPending > 0 {
 		job.Done = false
 	}
+	if err = s.Pool.QueryRow(ctx, `SELECT count(*),min(available_at) FROM (SELECT available_at FROM crawler_retries WHERE kind='page' AND job_id=$1 UNION ALL SELECT r.available_at FROM job_details d JOIN crawler_retries r ON r.kind='detail' AND r.platform=d.platform AND r.listing_id=d.listing_id WHERE d.job_id=$1) waiting`, jobID).Scan(&job.RetriesPending, &job.RetryAt); err != nil {
+		return job, err
+	}
+
 	return job, nil
 }
 
@@ -463,8 +530,12 @@ func (s *Store) Action(ctx context.Context, jobID, action string, platform vehic
 		}
 		changed, updateErr := tx.Exec(ctx, `UPDATE crawl_tasks SET status='queued',attempts=0,available_at=now() WHERE job_id=$1 AND status IN ('paused','unavailable','retry','limited') AND ($2='' OR platform=$2)`, jobID, platform)
 		err = updateErr
-		if err == nil && changed.RowsAffected() > 0 {
-			_, err = tx.Exec(ctx, `UPDATE crawl_jobs SET status='queued',mode='full',updated_at=now() WHERE id=$1`, jobID)
+		var delayed bool
+		if err == nil {
+			err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM crawl_tasks WHERE job_id=$1 AND status='delayed')`, jobID).Scan(&delayed)
+		}
+		if err == nil && (changed.RowsAffected() > 0 || delayed) {
+			_, err = tx.Exec(ctx, `UPDATE crawl_jobs SET status='queued',updated_at=now() WHERE id=$1`, jobID)
 		}
 	} else {
 		return errors.New("invalid job action")
@@ -476,12 +547,15 @@ func (s *Store) Action(ctx context.Context, jobID, action string, platform vehic
 }
 
 func (s *Store) Schedule(ctx context.Context) error {
+	if err := s.releaseRetries(ctx); err != nil {
+		return err
+	}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT s.id,s.criteria,(s.last_full IS NULL OR s.last_full<now()-interval '24 hours') FROM crawl_searches s WHERE s.next_refresh<=now() AND s.requested_at>now()-interval '7 days' AND NOT EXISTS(SELECT 1 FROM crawl_jobs j WHERE j.search_id=s.id AND j.status IN ('queued','running','paused')) ORDER BY s.next_refresh FOR UPDATE OF s SKIP LOCKED LIMIT 20`)
+	rows, err := tx.Query(ctx, `SELECT s.id,s.criteria,s.coverage FROM crawl_searches s WHERE s.next_refresh<=now() AND (s.coverage OR s.requested_at>now()-interval '7 days') AND NOT EXISTS(SELECT 1 FROM crawl_jobs j WHERE j.search_id=s.id AND j.status IN ('queued','running','paused')) ORDER BY s.next_refresh FOR UPDATE OF s SKIP LOCKED LIMIT 20`)
 	if err != nil {
 		return err
 	}
@@ -527,6 +601,18 @@ func (s *Store) Search(ctx context.Context, q crawljobs.InventoryQuery) (crawljo
 	if q.Offset < 0 {
 		q.Offset = 0
 	}
+	var cacheKey string
+	if s.InventoryCache != nil {
+		var revision int64
+		if err := s.Pool.QueryRow(ctx, `SELECT revision FROM inventory_revision WHERE id=true`).Scan(&revision); err != nil {
+			return crawljobs.InventoryResult{}, err
+		}
+		raw, _ := json.Marshal(q)
+		cacheKey = fmt.Sprintf("%d:%s", revision, raw)
+		if result, ok := s.InventoryCache.GetInventory(ctx, cacheKey); ok {
+			return result, nil
+		}
+	}
 	result := crawljobs.InventoryResult{Data: []vehicle.NormalizedVehicleListing{}, Limit: q.Limit, Offset: q.Offset}
 	var clauses []string
 	var args []any
@@ -534,7 +620,7 @@ func (s *Store) Search(ctx context.Context, q crawljobs.InventoryQuery) (crawljo
 		args = append(args, value)
 		clauses = append(clauses, fmt.Sprintf(format, len(args)))
 	}
-	text := vehicle.NormalizeModelText(q.Text)
+	text := vehicle.NormalizeModelText(q.Model + " " + q.Text)
 	if text != "" {
 		add(`(l.search_vector @@ plainto_tsquery('simple',$%[1]d) OR l.normalized_text %% $%[1]d OR $%[1]d <%% l.normalized_text)`, text)
 	}
@@ -555,7 +641,10 @@ func (s *Store) Search(ctx context.Context, q crawljobs.InventoryQuery) (crawljo
 	if q.City != "" && q.City != "iran" {
 		add(`l.city=$%d`, q.City)
 	}
-	if q.Category != "" {
+
+	// Legacy category-only clients retain their exact search-membership filter.
+	// Inventory-first clients provide model text to match facts from every crawl partition.
+	if q.Category != "" && q.Model == "" {
 		add(`EXISTS(SELECT 1 FROM search_listings m JOIN crawl_searches s ON s.id=m.search_id WHERE m.platform=l.platform AND m.listing_id=l.id AND s.criteria->>'bamaCategory'=$%d)`, q.Category)
 	}
 	for _, filter := range []struct {
@@ -612,5 +701,11 @@ func (s *Store) Search(ctx context.Context, q crawljobs.InventoryQuery) (crawljo
 		}
 		result.Data = append(result.Data, row)
 	}
-	return result, rows.Err()
+	if err = rows.Err(); err != nil {
+		return result, err
+	}
+	if s.InventoryCache != nil {
+		s.InventoryCache.SetInventory(ctx, cacheKey, result)
+	}
+	return result, nil
 }

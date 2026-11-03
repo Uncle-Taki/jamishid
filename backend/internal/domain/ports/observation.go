@@ -47,6 +47,10 @@ func FailureKind(err error) string {
 	if err == nil {
 		return "none"
 	}
+	var deferred *SourceError
+	if errors.As(err, &deferred) && (deferred.Kind == "source_wait" || deferred.Kind == "budget_unavailable" || deferred.Kind == "egress_unavailable") {
+		return deferred.Kind
+	}
 	if errors.Is(err, context.Canceled) {
 		return "canceled"
 	}

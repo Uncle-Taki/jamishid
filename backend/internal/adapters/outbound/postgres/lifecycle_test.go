@@ -36,7 +36,7 @@ func TestSummaryPublicationDetailRecoveryAndLifecycle(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatal(err)
 	}
-	row := vehicle.NormalizedVehicleListing{ID: "durable-bike", Platform: platform, Title: "بنلی", PriceToman: 100, MileageKm: -1, BodyStatus: vehicle.BodyStatusUnknown, URL: "https://bama.ir/motorcycle/durable-bike", VehicleType: vehicle.VehicleTypeMotorcycle}
+	row := vehicle.NormalizedVehicleListing{ID: "durable-bike", Platform: platform, CityID: "tehran", NeighborhoodFa: "تهران، آزادی", Title: "بنلی", PriceToman: 100, MileageKm: -1, BodyStatus: vehicle.BodyStatusUnknown, URL: "https://bama.ir/motorcycle/durable-bike", VehicleType: vehicle.VehicleTypeMotorcycle}
 	observations, err := s.Prepare(ctx, []vehicle.NormalizedVehicleListing{row})
 	if err != nil {
 		t.Fatal(err)
@@ -91,6 +91,28 @@ func TestSummaryPublicationDetailRecoveryAndLifecycle(t *testing.T) {
 		if e = s.CompleteDetail(ctx, d, d.Listing, code, kind); e != nil {
 			t.Fatal(e)
 		}
+	}
+	// Reverification becomes due after 48 hours, using the persisted source URL.
+	exec("UPDATE listings SET last_checked=now()-interval '47 hours'")
+	if err = s.ScheduleVerification(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, e := s.ClaimDetail(ctx); e != nil || claimed {
+		t.Fatalf("fresh listing was requeued: %v", e)
+	}
+	exec("UPDATE listings SET last_checked=now()-interval '49 hours'")
+	if err = s.ScheduleVerification(ctx); err != nil {
+		t.Fatal(err)
+	}
+	verification, claimed, e := s.ClaimDetail(ctx)
+	if e != nil || !claimed || verification.Purpose != "verify" || verification.Listing.URL != row.URL {
+		t.Fatalf("48-hour verification lost source identity: %+v %v", verification, e)
+	}
+	if err = s.ScheduleVerification(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.CompleteDetail(ctx, verification, facts, 200, ""); err != nil {
+		t.Fatal("scheduler replaced running verification", err)
 	}
 	for _, failure := range []struct {
 		code int

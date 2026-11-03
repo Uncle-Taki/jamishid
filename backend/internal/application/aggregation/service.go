@@ -110,6 +110,9 @@ func (s *AggregationService) AggregateWithSources(ctx context.Context, criteria 
 			if errors.As(batch.err, &sourceErr) && sourceErr.StatusCode >= 400 && sourceErr.StatusCode < 500 && sourceErr.StatusCode != 429 {
 				status.FailureKind = "http_4xx"
 			}
+			if errors.As(batch.err, &sourceErr) && sourceErr.StatusCode >= 500 {
+				status.FailureKind = "http_5xx"
+			}
 			status.NextCursor = criteria.Cursors[selected[i].Platform()]
 		} else {
 			successes++
@@ -152,7 +155,7 @@ func (s *AggregationService) sourcePage(ctx context.Context, sc ports.Marketplac
 	}
 	platform := sc.Platform()
 	sourceCriteria := vehicle.SearchCriteria{Query: criteria.Query, Keywords: criteria.Keywords,
-		BamaCategory: criteria.BamaCategory, CitySlug: criteria.CitySlug, Type: criteria.Type, Platform: &platform,
+		NativeCategory: criteria.NativeCategory, BamaCategory: criteria.BamaCategory, CitySlug: criteria.CitySlug, Type: criteria.Type, Platform: &platform,
 		Cursors: map[vehicle.Platform]string{platform: criteria.Cursors[platform]}}
 	key := generateCacheKey(sourceCriteria)
 	policy := ports.CrawlPolicyFrom(ctx)
@@ -243,5 +246,5 @@ func matches(l vehicle.NormalizedVehicleListing, c vehicle.SearchCriteria) bool 
 func generateCacheKey(criteria vehicle.SearchCriteria) string {
 	b, _ := json.Marshal(criteria)
 	hash := sha256.Sum256(b)
-	return hex.EncodeToString(hash[:])
+	return "city-v2:" + hex.EncodeToString(hash[:])
 }

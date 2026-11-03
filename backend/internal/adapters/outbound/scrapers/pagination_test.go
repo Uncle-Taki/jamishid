@@ -109,10 +109,10 @@ func TestBamaAllIranOmitsRegionFilter(t *testing.T) {
 				if city == "iran" && r.URL.Query().Has("region") {
 					t.Errorf("national search still has a region: %s", r.URL)
 				}
-				if city == "tehran" && r.URL.Query().Get("region") != "tehran" {
+				if city == "tehran" && r.URL.Query().Get("region") != "tehran,tehran" {
 					t.Errorf("city filter lost: %s", r.URL)
 				}
-				w.Write([]byte(`{"status":true,"metadata":{"has_next":false},"data":{"ads":[{"detail":{"code":"valid","title":"بنلی TNT 180S","url":"/motorcycle/detail-valid-benelli-tnt180s-1402"}}]}}`))
+				w.Write([]byte(`{"status":true,"metadata":{"has_next":false},"data":{"ads":[{"detail":{"location":"تهران، آزادی","code":"valid","title":"بنلی TNT 180S","url":"/motorcycle/detail-valid-benelli-tnt180s-1402"}}]}}`))
 			}))
 			defer srv.Close()
 			page, err := PublicSearchPage(context.Background(), NewSharedClient(), srv.URL, vehicle.PlatformBama, c, token)
@@ -127,10 +127,10 @@ func TestBamaUsesSelectedNativeModelAndPageIndex(t *testing.T) {
 	c := vehicle.SearchCriteria{Type: vehicle.VehicleTypeCar, CitySlug: "tehran", Query: "پژو 206", BamaCategory: "peugeot-206ir"}
 	token := encodeCursor(vehicle.PlatformBama, c, 2, bamaContinuation{Vehicle: "peugeot,206ir", Index: 1})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("vehicle") != "peugeot,206ir" || r.URL.Query().Get("region") != "tehran" || r.URL.Query().Get("pageIndex") != "1" {
+		if r.URL.Query().Get("vehicle") != "peugeot,206ir" || r.URL.Query().Get("region") != "tehran,tehran" || r.URL.Query().Get("pageIndex") != "1" {
 			t.Errorf("lost native filters: %s", r.URL)
 		}
-		w.Write([]byte(`{"status":true,"metadata":{"has_next":false},"data":{"ads":[{"detail":{"code":"a","title":"پژو 206","url":"/car/detail-a-peugeot-206ir-type5-1398","year":"1398","mileage":"120,000 km"},"price":{"price":"900,000,000"}},{"detail":{"code":"promoted","title":"پژو 207","url":"/car/detail-promoted-peugeot-207-1398"},"price":{"price":"1000000000"}}]}}`))
+		w.Write([]byte(`{"status":true,"metadata":{"has_next":false},"data":{"ads":[{"detail":{"location":"تهران، آزادی","code":"a","title":"پژو 206","url":"/car/detail-a-peugeot-206ir-type5-1398","year":"1398","mileage":"120,000 km"},"price":{"price":"900,000,000"}},{"detail":{"location":"تهران، آزادی","code":"promoted","title":"پژو 207","url":"/car/detail-promoted-peugeot-207-1398"},"price":{"price":"1000000000"}}]}}`))
 	}))
 	defer ts.Close()
 	page, e := PublicSearchPage(context.Background(), NewSharedClient(), ts.URL, vehicle.PlatformBama, c, token)

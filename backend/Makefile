@@ -1,4 +1,6 @@
-.PHONY: all build test clean run
+.PHONY: all build test clean run dev
+
+AIR_VERSION := v1.62.0
 
 all: build test
 
@@ -15,3 +17,6 @@ clean:
 
 run:
 	go run ./cmd/api/main.go
+
+dev:
+	go run github.com/air-verse/air@$(AIR_VERSION) -c .air.toml

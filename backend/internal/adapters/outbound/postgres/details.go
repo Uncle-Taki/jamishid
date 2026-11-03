@@ -71,8 +71,11 @@ func recordSummary(ctx context.Context, tx pgx.Tx, jobID string, observation cra
 	if !observation.NeedsDetails {
 		return nil
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO detail_tasks(platform,listing_id,summary_hash) VALUES($1,$2,$3) ON CONFLICT(platform,listing_id) DO UPDATE SET summary_hash=EXCLUDED.summary_hash,status=CASE WHEN detail_tasks.status='running' AND detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.status ELSE 'queued' END,attempts=CASE WHEN detail_tasks.status='running' AND detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.attempts ELSE 0 END,token=CASE WHEN detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.token ELSE null END,available_at=now(),purpose='enrich'`, row.Platform, row.ID, observation.SummaryHash)
+	_, err := tx.Exec(ctx, `INSERT INTO detail_tasks(platform,listing_id,summary_hash) VALUES($1,$2,$3) ON CONFLICT(platform,listing_id) DO UPDATE SET summary_hash=EXCLUDED.summary_hash,status=CASE WHEN detail_tasks.status IN ('running','delayed') AND detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.status ELSE 'queued' END,attempts=CASE WHEN detail_tasks.status IN ('running','delayed') AND detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.attempts ELSE 0 END,token=CASE WHEN detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.token ELSE null END,available_at=now(),purpose='enrich'`, row.Platform, row.ID, observation.SummaryHash)
 	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM crawler_retries WHERE kind='detail' AND platform=$1 AND listing_id=$2 AND summary_hash<>$3`, row.Platform, row.ID, observation.SummaryHash); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO job_details VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, jobID, row.Platform, row.ID)
@@ -110,6 +113,10 @@ func (s *Store) CompleteDetail(ctx context.Context, task crawljobs.DetailTask, r
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT id FROM inventory_revision WHERE id=true FOR UPDATE`); err != nil {
+		return err
+	}
+
 	var hash string
 	if err = tx.QueryRow(ctx, `SELECT summary_hash FROM listings WHERE platform=$1 AND id=$2 FOR UPDATE`, task.Listing.Platform, task.Listing.ID).Scan(&hash); err != nil {
 		return err
@@ -121,6 +128,22 @@ func (s *Store) CompleteDetail(ctx context.Context, task crawljobs.DetailTask, r
 	if !valid || hash != task.Hash {
 		return crawljobs.ErrLeaseLost
 	}
+	deferred := failure == "source_wait" || failure == "budget_unavailable" || failure == "egress_unavailable" || code == 429
+	if deferred {
+		if code == 429 {
+			if _, err = tx.Exec(ctx, `UPDATE listings SET last_checked=now(),check_error=$3 WHERE platform=$1 AND id=$2`, task.Listing.Platform, task.Listing.ID, failure); err != nil {
+				return err
+			}
+			if err = recordEvent(ctx, tx, task.Listing, "check", code, failure, false, task.Listing); err != nil {
+				return err
+			}
+		}
+		_, err = tx.Exec(ctx, `UPDATE detail_tasks SET status='retry',attempts=greatest(0,attempts-1),token=NULL,lease_until=NULL,error_kind=$3,available_at=now()+interval '1 minute' WHERE platform=$1 AND listing_id=$2`, task.Listing.Platform, task.Listing.ID, failure)
+		if err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
 	state := "complete"
 	available := "active"
 	if failure != "" {
@@ -131,6 +154,12 @@ func (s *Store) CompleteDetail(ctx context.Context, task crawljobs.DetailTask, r
 			state = "retry"
 		} else {
 			state = "failed"
+		}
+	}
+	if state == "failed" && transientRetry(failure, code) {
+		state = "delayed"
+		if err = s.enqueueRetry(ctx, tx, "detail", string(task.Listing.Platform), task.Listing.ID, task.Hash, failure); err != nil {
+			return err
 		}
 	}
 	if failure == "" {
@@ -166,7 +195,7 @@ func (s *Store) CompleteDetail(ctx context.Context, task crawljobs.DetailTask, r
 
 // Reverification is bounded and never infers removal from absence in search pages.
 func (s *Store) ScheduleVerification(ctx context.Context) error {
-	_, err := s.Pool.Exec(ctx, `INSERT INTO detail_tasks(platform,listing_id,summary_hash,purpose) SELECT l.platform,l.id,l.summary_hash,'verify' FROM listings l WHERE l.last_seen>now()-interval '7 days' AND (l.last_checked IS NULL OR l.last_checked<now()-interval '24 hours') ORDER BY l.last_checked NULLS FIRST LIMIT 100 ON CONFLICT(platform,listing_id) DO UPDATE SET status='queued',attempts=0,available_at=now(),purpose='verify',summary_hash=EXCLUDED.summary_hash WHERE detail_tasks.status IN ('complete','failed')`)
+	_, err := s.Pool.Exec(ctx, `INSERT INTO detail_tasks(platform,listing_id,summary_hash,purpose) SELECT l.platform,l.id,l.summary_hash,'verify' FROM listings l WHERE NOT EXISTS (SELECT 1 FROM detail_tasks d WHERE d.platform=l.platform AND d.listing_id=l.id AND d.status IN ('queued','running','retry','delayed')) AND l.last_seen>now()-interval '7 days' AND (l.last_checked IS NULL OR l.last_checked<now()-interval '48 hours') ORDER BY l.last_checked NULLS FIRST LIMIT 100 ON CONFLICT(platform,listing_id) DO UPDATE SET status='queued',attempts=0,available_at=now(),purpose='verify',summary_hash=EXCLUDED.summary_hash WHERE detail_tasks.status IN ('complete','failed')`)
 	return err
 }
 func (s *Store) History(ctx context.Context, platform vehicle.Platform, listingID string, offset int) (crawljobs.ListingHistory, error) {
@@ -201,7 +230,7 @@ func (s *Store) History(ctx context.Context, platform vehicle.Platform, listingI
 }
 
 func (s *Store) Recheck(ctx context.Context, platform vehicle.Platform, listingID string) error {
-	result, err := s.Pool.Exec(ctx, `INSERT INTO detail_tasks(platform,listing_id,summary_hash,purpose) SELECT platform,id,summary_hash,'verify' FROM listings WHERE platform=$1 AND id=$2 ON CONFLICT(platform,listing_id) DO UPDATE SET status=CASE WHEN detail_tasks.status='running' THEN 'running' ELSE 'queued' END,attempts=CASE WHEN detail_tasks.status='running' THEN detail_tasks.attempts ELSE 0 END,available_at=now(),purpose='verify'`, platform, listingID)
+	result, err := s.Pool.Exec(ctx, `INSERT INTO detail_tasks(platform,listing_id,summary_hash,purpose) SELECT platform,id,summary_hash,'verify' FROM listings WHERE platform=$1 AND id=$2 ON CONFLICT(platform,listing_id) DO UPDATE SET status=CASE WHEN detail_tasks.status IN ('running','delayed') THEN detail_tasks.status ELSE 'queued' END,attempts=CASE WHEN detail_tasks.status IN ('running','delayed') THEN detail_tasks.attempts ELSE 0 END,available_at=now(),purpose='verify'`, platform, listingID)
 	if err != nil {
 		return err
 	}

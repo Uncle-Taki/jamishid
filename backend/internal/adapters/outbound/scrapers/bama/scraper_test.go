@@ -11,7 +11,7 @@ import (
 
 func TestScraper_PublicSearch(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" || r.URL.Query().Get("region") != "tehran" || r.URL.Path != "/car/peugeot" {
+		if r.Method != "GET" || r.URL.Query().Get("region") != "tehran-tehran" || r.URL.Path != "/car/peugeot" {
 			t.Errorf("wrong search request: %s", r.URL)
 		}
 		w.Write([]byte(`<script id="__NUXT_DATA__" type="application/json">[{"code":1,"title":2,"trim":3,"url":4,"year":5,"mileage":6,"body_status":7,"price":8,"location":10},"real-token","پژو 206","تیپ 5","/car/detail-real-token","1402","کارکرد 15,000 کیلومتر","بدون رنگ",{"price":9},"350,000,000","تهران، مرکز"]</script>`))

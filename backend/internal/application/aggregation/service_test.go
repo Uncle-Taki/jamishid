@@ -178,3 +178,24 @@ func TestFiltersDoNotTreatUnknownFactsAsKnown(t *testing.T) {
 		t.Fatal("unknown mileage treated as zero")
 	}
 }
+
+type coverageScraper struct{ calls int }
+
+func (s *coverageScraper) Platform() vehicle.Platform { return vehicle.PlatformBama }
+func (s *coverageScraper) Scrape(_ context.Context, c vehicle.SearchCriteria) ([]vehicle.NormalizedVehicleListing, error) {
+	s.calls++
+	return []vehicle.NormalizedVehicleListing{{ID: c.NativeCategory, Platform: vehicle.PlatformBama, Title: c.NativeCategory, VehicleType: vehicle.VehicleTypeCar}}, nil
+}
+func TestNativeCoverageCategoriesReachAdaptersAndHaveSeparateCacheKeys(t *testing.T) {
+	source := &coverageScraper{}
+	service := NewAggregationService([]ports.MarketplaceScraper{source}, memory.NewCache(time.Hour), vehicle.ScoreWeights{PriceWeight: 100})
+	for _, category := range []string{"first-brand", "second-brand", "first-brand"} {
+		result, err := service.AggregateWithSources(context.Background(), vehicle.SearchCriteria{Type: vehicle.VehicleTypeCar, CitySlug: "iran", NativeCategory: category})
+		if err != nil || len(result.Listings) != 1 || result.Listings[0].ID != category {
+			t.Fatalf("lost native partition %s: %+v %v", category, result, err)
+		}
+	}
+	if source.calls != 2 {
+		t.Fatalf("partition cache calls: %d", source.calls)
+	}
+}

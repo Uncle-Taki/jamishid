@@ -60,6 +60,8 @@ func main() {
 		sheypoorScraper,
 	}
 
+	var inventoryCache crawljobs.InventoryCache
+	rediscache.SetBudgetFloor(2 * time.Second)
 	var cache ports.ListingCacheRepository = memory.NewCache(24 * time.Hour)
 	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
 		shared, err := rediscache.New(redisURL, 24*time.Hour, observations)
@@ -81,6 +83,7 @@ func main() {
 			log.Fatal(err)
 		}
 		cache = shared
+		inventoryCache = shared
 		scrapers.ConfigureDetailCache(shared)
 		scrapers.ConfigureProviderBudget(shared)
 		log.Println("Shared Redis page/detail cache enabled (24h TTL)")
@@ -105,10 +108,23 @@ func main() {
 			log.Fatalf("PostgreSQL initialization failed: %v", err)
 		}
 		defer store.Close()
+		store.RetryDelay = time.Hour
+		if value := os.Getenv("CRAWLER_RETRY_DELAY"); value != "" {
+			delay, parseErr := time.ParseDuration(value)
+			if parseErr != nil || delay < time.Hour || delay > 2*time.Hour {
+				log.Fatal("CRAWLER_RETRY_DELAY must be between 1h and 2h")
+			}
+			store.RetryDelay = delay
+		}
+		store.InventoryCache = inventoryCache
+		scrapers.ConfigureEgressPool(store)
 	}
 	if os.Getenv("APP_ROLE") == "worker" {
 		if store == nil {
 			log.Fatal("Worker requires DATABASE_URL")
+		}
+		if inventoryCache == nil {
+			log.Fatal("Worker requires REDIS_URL for shared source budgets and cursor signing")
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
@@ -135,6 +151,9 @@ func main() {
 			ticker := time.NewTicker(time.Minute)
 			defer ticker.Stop()
 			for {
+				if err := store.RefreshCoverageCatalog(ctx, scrapers.DefaultProviderCatalog().Categories); err != nil && ctx.Err() == nil {
+					log.Printf("Coverage catalog: %v", err)
+				}
 				if err := store.ScheduleVerification(ctx); err != nil && ctx.Err() == nil {
 					log.Printf("Listing verification: %v", err)
 				}
@@ -156,6 +175,9 @@ func main() {
 		handler.SetJobs(store)
 	}
 	router := inboundHttp.SetupRouter(handler)
+	if store != nil {
+		inboundHttp.ConfigureOperations(router, store, os.Getenv("ADMIN_API_TOKEN"))
+	}
 
 	srv := &http.Server{
 		Addr:    ":8080",

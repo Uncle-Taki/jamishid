@@ -1,0 +1,38 @@
+{
+  "note": "Public source scoring fields; Bama city corrected from its source location by migration 004. No cross-source vehicle identity is inferred.",
+  "listings": [
+    {
+      "id": "bama-e7vfx1de",
+      "platform": "bama",
+      "title": "آئودی، Q5 e-tron 40",
+      "priceToman": 17000000000,
+      "mileageKm": 0,
+      "year": 2024,
+      "bodyStatus": "perfect",
+      "brandModel": "آئودی  Q5 e-tron",
+      "trimName": "40",
+      "cityId": "karaj",
+      "neighborhoodFa": "کرج / محمدشهر",
+      "gearbox": "اتوماتیک",
+      "vehicleType": "car",
+      "url": "https://bama.ir/car/detail-e7vfx1de-audi-q5etron-40-2024",
+      "scrapedAt": "2026-11-03T20:26:31Z"
+    },
+    {
+      "id": "divar-ga3-Nh9W",
+      "platform": "divar",
+      "title": "آئودی Q5 صفر 2024",
+      "priceToman": 17000000000,
+      "mileageKm": 0,
+      "year": 2024,
+      "bodyStatus": "perfect",
+      "brandModel": "آئودی کیو 5 ای ترون 40",
+      "cityId": "karaj",
+      "neighborhoodFa": "فاز ۱ مهرشهر",
+      "gearbox": "اتوماتیک",
+      "vehicleType": "car",
+      "url": "https://divar.ir/v/آئودی-q5-صفر-2024/ga3-Nh9W",
+      "scrapedAt": "2026-11-03T20:26:10Z"
+    }
+  ]
+}

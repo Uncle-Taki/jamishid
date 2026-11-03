@@ -5,7 +5,7 @@ import (
 	"sort"
 )
 
-const ScoringVersion = "utility-v2"
+const ScoringVersion = "utility-v3"
 
 func modelIdentity(text string) string { return NormalizeModelText(text) }
 func finitePositive(n float64) bool    { return n > 0 && !math.IsNaN(n) && !math.IsInf(n, 0) }
@@ -23,10 +23,11 @@ func median(values []float64) float64 {
 }
 func missingEvidence(row NormalizedVehicleListing) []string {
 	fields := []string{}
+	model, trim := scoringIdentity(row)
 	if !finitePositive(row.PriceToman) {
 		fields = append(fields, "price")
 	}
-	if modelIdentity(row.BrandModel) == "" {
+	if model == "" {
 		fields = append(fields, "model")
 	}
 	if row.VehicleType == "" {
@@ -44,7 +45,7 @@ func missingEvidence(row NormalizedVehicleListing) []string {
 	if row.CityID == "" {
 		fields = append(fields, "region")
 	}
-	if modelIdentity(row.TrimName) == "" {
+	if trim == "" {
 		fields = append(fields, "trim")
 	}
 	return fields
@@ -62,7 +63,7 @@ type dealCohort struct {
 func buildDealCohort(target NormalizedVehicleListing, pool []NormalizedVehicleListing) dealCohort {
 	result := dealCohort{scope: "none", level: "low", missing: missingEvidence(target), reasons: []string{}}
 	seen := map[string]bool{string(target.Platform) + ":" + target.ID: true}
-	model := modelIdentity(target.BrandModel)
+	model, targetTrim := scoringIdentity(target)
 	candidates := []NormalizedVehicleListing{}
 	local := []NormalizedVehicleListing{}
 	if model != "" && target.VehicleType != "" {
@@ -72,10 +73,11 @@ func buildDealCohort(target NormalizedVehicleListing, pool []NormalizedVehicleLi
 				continue
 			}
 			seen[key] = true
-			if !finitePositive(peer.PriceToman) || peer.VehicleType != target.VehicleType || modelIdentity(peer.BrandModel) != model {
+			peerModel, peerTrim := scoringIdentity(peer)
+			if !finitePositive(peer.PriceToman) || peer.VehicleType != target.VehicleType || peerModel != model {
 				continue
 			}
-			if target.TrimName != "" && peer.TrimName != "" && modelIdentity(target.TrimName) != modelIdentity(peer.TrimName) {
+			if targetTrim != "" && peerTrim != "" && targetTrim != peerTrim {
 				continue
 			}
 			if target.Gearbox != "" && peer.Gearbox != "" && modelIdentity(target.Gearbox) != modelIdentity(peer.Gearbox) {
@@ -121,12 +123,13 @@ func buildDealCohort(target NormalizedVehicleListing, pool []NormalizedVehicleLi
 	}
 	prices := []float64{}
 	peerCoverage := 0.0
-	missingTrim := target.TrimName == ""
+	missingTrim := targetTrim == ""
 	incomplete := false
 	for _, p := range result.peers {
 		prices = append(prices, p.PriceToman)
 		peerCoverage += coverage(p)
-		missingTrim = missingTrim || p.TrimName == ""
+		_, peerTrim := scoringIdentity(p)
+		missingTrim = missingTrim || peerTrim == ""
 		incomplete = incomplete || len(missingEvidence(p)) > 0
 	}
 	reference := median(prices)

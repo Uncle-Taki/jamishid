@@ -47,7 +47,13 @@ func (h *AggregationHandler) CreateJob(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	job, err := h.jobs.Submit(ctx, vehicle.SearchCriteria{Query: r.Query, Keywords: r.Keywords, BamaCategory: r.BamaCategory, CitySlug: r.CitySlug, Type: r.Type, Platform: r.Platform}, request.Refresh)
+	submit := h.jobs.Submit
+	if status, ok := h.jobs.(interface {
+		SubmitStatus(context.Context, vehicle.SearchCriteria, bool) (crawljobs.Job, error)
+	}); ok && c.Query("statusOnly") == "1" {
+		submit = status.SubmitStatus
+	}
+	job, err := submit(ctx, vehicle.SearchCriteria{Query: r.Query, Keywords: r.Keywords, BamaCategory: r.BamaCategory, CitySlug: r.CitySlug, Type: r.Type, Platform: r.Platform}, false)
 	if err != nil {
 		jobError(c, err)
 		return
@@ -61,7 +67,15 @@ func (h *AggregationHandler) Job(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	job, err := h.jobs.Get(ctx, c.Param("id"))
+	var job crawljobs.Job
+	var err error
+	if status, ok := h.jobs.(interface {
+		Status(context.Context, string) (crawljobs.Job, error)
+	}); ok && c.Query("statusOnly") == "1" {
+		job, err = status.Status(ctx, c.Param("id"))
+	} else {
+		job, err = h.jobs.Get(ctx, c.Param("id"))
+	}
 	if err != nil {
 		jobError(c, err)
 		return
@@ -99,8 +113,8 @@ func (h *AggregationHandler) Inventory(c *gin.Context) {
 		c.JSON(503, gin.H{"error": "Stored inventory requires PostgreSQL"})
 		return
 	}
-	q := crawljobs.InventoryQuery{Text: c.Query("q"), Type: c.Query("type"), City: c.Query("city"), Platform: c.Query("platform"), Category: c.Query("category"), Body: c.Query("body"), Sort: c.Query("sort"), Limit: 50}
-	if len([]rune(q.Text)) > 200 || (q.Type != "" && q.Type != "car" && q.Type != "motorcycle") || (q.Platform != "" && !validPlatform(vehicle.Platform(q.Platform))) {
+	q := crawljobs.InventoryQuery{Text: c.Query("q"), Model: c.Query("model"), Type: c.Query("type"), City: c.Query("city"), Platform: c.Query("platform"), Category: c.Query("category"), Body: c.Query("body"), Sort: c.Query("sort"), Limit: 50}
+	if len([]rune(q.Text)) > 200 || len([]rune(q.Model)) > 200 || (q.Type != "" && q.Type != "car" && q.Type != "motorcycle") || (q.Platform != "" && !validPlatform(vehicle.Platform(q.Platform))) {
 		c.JSON(400, gin.H{"error": "Invalid inventory filters"})
 		return
 	}

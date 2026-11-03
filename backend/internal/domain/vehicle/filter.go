@@ -3,6 +3,7 @@ package vehicle
 import "time"
 
 type SearchCriteria struct {
+	NativeCategory  string              `json:"nativeCategory,omitempty"`
 	Keywords        string              `json:"keywords,omitempty"`
 	BamaCategory    string              `json:"bamaCategory,omitempty"`
 	Cursors         map[Platform]string `json:"cursors,omitempty"`
