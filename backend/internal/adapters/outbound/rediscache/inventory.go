@@ -4,25 +4,32 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/application/crawljobs"
 	"time"
+
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/application/crawljobs"
+	"github.com/redis/go-redis/v9"
 )
 
 // Revision is read from PostgreSQL before looking up cached results. Every listing
 // mutation changes it in the same transaction, so worker/API restarts cannot lose invalidation.
-func (c *Cache) GetInventory(ctx context.Context, key string) (crawljobs.InventoryResult, bool) {
+func (c *Cache) GetInventory(ctx context.Context, key string) (crawljobs.InventoryResult, string) {
 	cacheCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
 	raw, err := c.client.Get(cacheCtx, inventoryKey(key)).Bytes()
 	if err != nil {
-		return crawljobs.InventoryResult{}, false
+		if errors.Is(err, redis.Nil) {
+			return crawljobs.InventoryResult{}, "miss"
+		}
+		return crawljobs.InventoryResult{}, "error"
 	}
 	var result crawljobs.InventoryResult
 	if json.Unmarshal(raw, &result) != nil {
-		return result, false
+		// Corrupt payloads are cache errors, not legitimate misses.
+		return crawljobs.InventoryResult{}, "error"
 	}
-	return result, true
+	return result, "hit"
 }
 func (c *Cache) SetInventory(ctx context.Context, key string, result crawljobs.InventoryResult) {
 	raw, err := json.Marshal(result)

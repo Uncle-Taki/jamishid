@@ -25,6 +25,7 @@ type Store struct {
 	Pool           *pgxpool.Pool
 	InventoryCache crawljobs.InventoryCache
 	RetryDelay     time.Duration
+	Metrics        Metrics
 }
 
 func New(ctx context.Context, url string) (*Store, error) {
@@ -284,6 +285,7 @@ func (s *Store) Commit(ctx context.Context, task crawljobs.Task, observations []
 		return err
 	}
 	newCount, changedCount, knownCount := 0, 0, 0
+	var invalidatedTickets int64
 	var overlapPages int
 	if err = tx.QueryRow(ctx, `SELECT overlap_pages FROM crawl_tasks WHERE job_id=$1 AND platform=$2`, task.JobID, task.Platform).Scan(&overlapPages); err != nil {
 		return err
@@ -316,8 +318,10 @@ func (s *Store) Commit(ctx context.Context, task crawljobs.Task, observations []
 		if err != nil {
 			return err
 		}
-		if err = recordSummary(ctx, tx, task.JobID, observation); err != nil {
+		if invalidated, err := recordSummary(ctx, tx, task.JobID, observation); err != nil {
 			return err
+		} else {
+			invalidatedTickets += invalidated
 		}
 		if _, err = tx.Exec(ctx, `INSERT INTO search_listings(search_id,platform,listing_id) VALUES($1,$2,$3) ON CONFLICT(search_id,platform,listing_id) DO UPDATE SET last_seen=now()`, task.SearchID, row.Platform, row.ID); err != nil {
 			return err
@@ -354,7 +358,13 @@ func (s *Store) Commit(ctx context.Context, task crawljobs.Task, observations []
 	if err = finishJob(ctx, tx, task.JobID); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	if invalidatedTickets > 0 {
+		s.metrics().RetryInvalidated("detail")
+	}
+	return nil
 }
 
 func (s *Store) Fail(ctx context.Context, task crawljobs.Task, kind string) error {
@@ -378,8 +388,10 @@ func (s *Store) Fail(ctx context.Context, task crawljobs.Task, kind string) erro
 	if (!deferred && task.Attempts >= 3) || kind == "parser" || kind == "validation" || kind == "http_4xx" {
 		state = "unavailable"
 	}
+	ticketScheduled := false
 	if state == "unavailable" && transientRetry(kind, 0) {
 		state = "delayed"
+		ticketScheduled = true
 		if err = s.enqueueRetry(ctx, tx, "page", string(task.Platform), task.JobID, "", kind); err != nil {
 			return err
 		}
@@ -397,7 +409,13 @@ func (s *Store) Fail(ctx context.Context, task crawljobs.Task, kind string) erro
 	if err = finishJob(ctx, tx, task.JobID); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	if ticketScheduled {
+		s.metrics().RetryScheduled("page")
+	}
+	return nil
 }
 
 func (s *Store) Get(ctx context.Context, jobID string) (crawljobs.Job, error) {
@@ -609,10 +627,15 @@ func (s *Store) Search(ctx context.Context, q crawljobs.InventoryQuery) (crawljo
 		}
 		raw, _ := json.Marshal(q)
 		cacheKey = fmt.Sprintf("%d:%s", revision, raw)
-		if result, ok := s.InventoryCache.GetInventory(ctx, cacheKey); ok {
+		result, outcome := s.InventoryCache.GetInventory(ctx, cacheKey)
+		s.metrics().InventoryCacheOutcome(outcome)
+		if outcome == "hit" {
 			return result, nil
 		}
+	} else {
+		s.metrics().InventoryCacheOutcome("bypass")
 	}
+	s.metrics().InventoryQuery()
 	result := crawljobs.InventoryResult{Data: []vehicle.NormalizedVehicleListing{}, Limit: q.Limit, Offset: q.Offset}
 	var clauses []string
 	var args []any

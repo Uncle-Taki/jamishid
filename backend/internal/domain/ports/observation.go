@@ -28,6 +28,21 @@ func (NoopObserver) Start(ctx context.Context, _ string, _ vehicle.Platform) (co
 	return ctx, func(Observation) {}
 }
 
+// RouteCapture lets an HTTP framework report the matched route template to an
+// outer instrumentation middleware without either layer importing the other.
+type RouteCapture struct{ Template string }
+
+type routeCaptureKey struct{}
+
+func WithRouteCapture(ctx context.Context, capture *RouteCapture) context.Context {
+	return context.WithValue(ctx, routeCaptureKey{}, capture)
+}
+
+func RouteCaptureFrom(ctx context.Context) *RouteCapture {
+	capture, _ := ctx.Value(routeCaptureKey{}).(*RouteCapture)
+	return capture
+}
+
 // SourceError describes transport/validation failures without exposing request URLs.
 type SourceError struct {
 	Kind       string

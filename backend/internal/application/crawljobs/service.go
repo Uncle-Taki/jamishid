@@ -58,7 +58,9 @@ type InventoryResult struct {
 	Offset int                                `json:"offset"`
 }
 type InventoryCache interface {
-	GetInventory(context.Context, string) (InventoryResult, bool)
+	// GetInventory returns the cached result and a bounded outcome:
+	// "hit", "miss" or "error".
+	GetInventory(context.Context, string) (InventoryResult, string)
 	SetInventory(context.Context, string, InventoryResult)
 }
 type Repository interface {
@@ -79,6 +81,9 @@ type Service struct {
 	}
 	Enrich   func(context.Context, []vehicle.NormalizedVehicleListing)
 	Observer ports.Observer
+	Metrics  WorkerMetrics
+	// Loop identifies this loop instance within the page pool (for heartbeats).
+	Loop string
 }
 
 func SearchIdentity(criteria vehicle.SearchCriteria) (string, vehicle.SearchCriteria) {
@@ -118,17 +123,25 @@ func SummaryHash(row vehicle.NormalizedVehicleListing) string {
 }
 
 func (s *Service) WorkOne(ctx context.Context) (bool, error) {
+	metrics := workerMetrics(s.Metrics)
 	task, ok, err := s.Store.Claim(ctx)
-	if err != nil || !ok {
+	if err != nil {
+		metrics.ClaimError("page")
 		return ok, err
 	}
+	if !ok {
+		return false, nil
+	}
+	finish := metrics.TaskStart("page", string(task.Platform))
+	outcome, failure := OutcomeSuccess, "none"
+	defer func() { finish(outcome, failure) }()
 	workCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
 	defer cancel()
 	observer := s.Observer
 	if observer == nil {
 		observer = ports.NoopObserver{}
 	}
-	workCtx, finish := observer.Start(workCtx, "crawl_job_page", task.Platform)
+	workCtx, finishObservation := observer.Start(workCtx, "crawl_job_page", task.Platform)
 	criteria := task.Criteria
 	criteria.Platform = &task.Platform
 	if task.Cursor != "" {
@@ -140,15 +153,33 @@ func (s *Service) WorkOne(ctx context.Context) (bool, error) {
 		fetchErr = errors.New("source unavailable")
 	}
 	if fetchErr != nil {
-		finish(ports.Observation{Error: fetchErr})
+		finishObservation(ports.Observation{Error: fetchErr})
 		if ctx.Err() != nil {
+			outcome, failure = OutcomeCanceled, ports.FailureKind(ctx.Err())
 			return true, ctx.Err()
 		}
 		kind := ports.FailureKind(fetchErr)
 		if len(result.Sources) == 1 && result.Sources[0].FailureKind != "" {
 			kind = result.Sources[0].FailureKind
 		}
-		return true, s.Store.Fail(ctx, task, kind)
+		if kind == "source_wait" || kind == "budget_unavailable" || kind == "egress_unavailable" || kind == "rate_limited" {
+			outcome = OutcomeDeferral
+		} else {
+			outcome = OutcomeSourceFailure
+		}
+		failure = kind
+		if err := s.Store.Fail(ctx, task, kind); err != nil {
+			switch {
+			case errors.Is(err, context.Canceled):
+				outcome, failure = OutcomeCanceled, "canceled"
+			case errors.Is(err, ErrLeaseLost):
+				outcome, failure = OutcomeLeaseLost, "lease_lost"
+			default:
+				outcome = OutcomePersistenceFailure
+			}
+			return true, err
+		}
+		return true, nil
 	}
 	rows := make([]vehicle.NormalizedVehicleListing, len(result.Listings))
 	for i, row := range result.Listings {
@@ -156,24 +187,43 @@ func (s *Service) WorkOne(ctx context.Context) (bool, error) {
 	}
 	observations, err := s.Store.Prepare(workCtx, rows)
 	if err != nil {
-		finish(ports.Observation{Error: err})
+		finishObservation(ports.Observation{Error: err})
+		outcome, failure = OutcomePersistenceFailure, ports.FailureKind(err)
 		return true, err
 	}
 	status := result.Sources[0]
 	err = s.Store.Commit(workCtx, task, observations, status.NextCursor, status.Page)
-	finish(ports.Observation{Error: err, Listings: len(observations)})
+	finishObservation(ports.Observation{Error: err, Listings: len(observations)})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			outcome, failure = OutcomeCanceled, "canceled"
+		} else if errors.Is(err, ErrLeaseLost) {
+			outcome, failure = OutcomeLeaseLost, "lease_lost"
+		} else {
+			outcome, failure = OutcomePersistenceFailure, ports.FailureKind(err)
+		}
+	}
 	return true, err
 }
 
 func (s *Service) Run(ctx context.Context, report func(error)) {
+	metrics := workerMetrics(s.Metrics)
+	loop := s.Loop
+	if loop == "" {
+		loop = "1"
+	}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	schedule := time.NewTicker(time.Minute)
 	defer schedule.Stop()
 	for {
+		metrics.LoopTick("page", loop)
 		select {
 		case <-schedule.C:
-			if err := s.Store.Schedule(ctx); err != nil {
+			finishSchedule := metrics.ScheduleAttempt("schedule")
+			err := s.Store.Schedule(ctx)
+			finishSchedule(err)
+			if err != nil {
 				report(err)
 			}
 		default:
@@ -193,7 +243,10 @@ func (s *Service) Run(ctx context.Context, report func(error)) {
 			return
 		case <-tick.C:
 		case <-schedule.C:
-			if err := s.Store.Schedule(ctx); err != nil {
+			finishSchedule := metrics.ScheduleAttempt("schedule")
+			err := s.Store.Schedule(ctx)
+			finishSchedule(err)
+			if err != nil {
 				report(err)
 			}
 		}

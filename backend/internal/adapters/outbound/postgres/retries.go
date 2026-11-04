@@ -2,8 +2,9 @@ package postgres
 
 import (
 	"context"
-	"github.com/jackc/pgx/v5"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func transientRetry(kind string, code int) bool {
@@ -68,6 +69,7 @@ func (s *Store) releaseRetry(ctx context.Context, kind, platform, subject, hash 
 		return err
 	}
 	defer tx.Rollback(ctx)
+	requeued := false
 	if kind == "page" {
 		// Paused jobs keep their tickets, so resuming does not erase the cooldown.
 		var searchID, status string
@@ -91,20 +93,32 @@ func (s *Store) releaseRetry(ctx context.Context, kind, platform, subject, hash 
 		if e != nil {
 			return e
 		}
-		if tag.RowsAffected() > 0 {
+		requeued = tag.RowsAffected() > 0
+		if requeued {
 			if _, err = tx.Exec(ctx, `UPDATE crawl_jobs SET status='running',updated_at=now() WHERE id=$1`, subject); err != nil {
 				return err
 			}
 		}
 	} else {
-		_, err = tx.Exec(ctx, `UPDATE detail_tasks SET status='queued',attempts=0,available_at=now(),token=NULL,lease_until=NULL WHERE listing_id=$1 AND platform=$2 AND summary_hash=$3 AND status='delayed' AND EXISTS(SELECT 1 FROM crawler_retries WHERE kind='detail' AND subject_id=$1 AND platform=$2 AND summary_hash=$3 AND available_at=$4)`, subject, platform, hash, due)
-		if err != nil {
-			return err
+		tag, e := tx.Exec(ctx, `UPDATE detail_tasks SET status='queued',attempts=0,available_at=now(),token=NULL,lease_until=NULL WHERE listing_id=$1 AND platform=$2 AND summary_hash=$3 AND status='delayed' AND EXISTS(SELECT 1 FROM crawler_retries WHERE kind='detail' AND subject_id=$1 AND platform=$2 AND summary_hash=$3 AND available_at=$4)`, subject, platform, hash, due)
+		if e != nil {
+			return e
 		}
+		requeued = tag.RowsAffected() > 0
 	}
 	_, err = tx.Exec(ctx, `DELETE FROM crawler_retries WHERE kind=$1 AND platform=$2 AND subject_id=$3 AND summary_hash=$4 AND available_at=$5`, kind, platform, subject, hash, due)
 	if err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	// Counted only after the deletion committed. A ticket removed without
+	// requeueing its parent task was stale/orphaned work, not released work.
+	if requeued {
+		s.metrics().RetryReleased(kind)
+	} else {
+		s.metrics().RetryDiscarded(kind)
+	}
+	return nil
 }

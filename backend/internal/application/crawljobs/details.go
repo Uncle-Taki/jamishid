@@ -3,9 +3,10 @@ package crawljobs
 import (
 	"context"
 	"errors"
+	"time"
+
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
-	"time"
 )
 
 type DetailTask struct {
@@ -19,20 +20,32 @@ type DetailRepository interface {
 	CompleteDetail(context.Context, DetailTask, vehicle.NormalizedVehicleListing, int, string) error
 }
 type DetailService struct {
-	Store DetailRepository
-	Fetch func(context.Context, vehicle.Platform, string) (vehicle.NormalizedVehicleListing, error)
-	Merge func(*vehicle.NormalizedVehicleListing, vehicle.NormalizedVehicleListing)
+	Store   DetailRepository
+	Fetch   func(context.Context, vehicle.Platform, string) (vehicle.NormalizedVehicleListing, error)
+	Merge   func(*vehicle.NormalizedVehicleListing, vehicle.NormalizedVehicleListing)
+	Metrics WorkerMetrics
+	// Loop identifies this loop instance within the detail pool (for heartbeats).
+	Loop string
 }
 
 func (s *DetailService) WorkOne(ctx context.Context) (bool, error) {
+	metrics := workerMetrics(s.Metrics)
 	task, ok, err := s.Store.ClaimDetail(ctx)
-	if err != nil || !ok {
+	if err != nil {
+		metrics.ClaimError("detail")
 		return ok, err
 	}
+	if !ok {
+		return false, nil
+	}
+	finish := metrics.TaskStart("detail", string(task.Listing.Platform))
+	outcome, failure := OutcomeSuccess, "none"
+	defer func() { finish(outcome, failure) }()
 	work, cancel := context.WithTimeout(ports.WithCrawlPolicy(ctx, ports.CrawlPolicy{RefreshDetails: true}), 15*time.Second)
 	defer cancel()
 	facts, fetchErr := s.Fetch(work, task.Listing.Platform, task.Listing.URL)
 	if ctx.Err() != nil {
+		outcome, failure = OutcomeCanceled, "canceled"
 		return true, ctx.Err()
 	}
 	code, kind := 200, ""
@@ -44,14 +57,36 @@ func (s *DetailService) WorkOne(ctx context.Context) (bool, error) {
 		if errors.As(fetchErr, &source) {
 			code = source.StatusCode
 		}
+		if kind == "source_wait" || kind == "budget_unavailable" || kind == "egress_unavailable" || code == 429 {
+			outcome, failure = OutcomeDeferral, kind
+		} else {
+			outcome, failure = OutcomeSourceFailure, kind
+		}
 	} else {
 		task.Facts = &facts
 		s.Merge(&row, facts)
 	}
-	return true, s.Store.CompleteDetail(ctx, task, row, code, kind)
+	if err := s.Store.CompleteDetail(ctx, task, row, code, kind); err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			outcome, failure = OutcomeCanceled, "canceled"
+		case errors.Is(err, ErrLeaseLost):
+			outcome, failure = OutcomeLeaseLost, "lease_lost"
+		default:
+			outcome, failure = OutcomePersistenceFailure, ports.FailureKind(err)
+		}
+		return true, err
+	}
+	return true, nil
 }
 func (s *DetailService) Run(ctx context.Context, report func(error)) {
+	metrics := workerMetrics(s.Metrics)
+	loop := s.Loop
+	if loop == "" {
+		loop = "1"
+	}
 	for ctx.Err() == nil {
+		metrics.LoopTick("detail", loop)
 		worked, err := s.WorkOne(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			report(err)

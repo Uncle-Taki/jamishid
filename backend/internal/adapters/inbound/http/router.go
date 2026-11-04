@@ -1,11 +1,25 @@
 package http
 
 import (
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/gin-gonic/gin"
 )
 
 func SetupRouter(handler *AggregationHandler) *gin.Engine {
 	r := gin.Default()
+
+	// Distinct 405s keep wrong-method requests visible to route metrics.
+	r.HandleMethodNotAllowed = true
+
+	// Report the matched route template to the outer telemetry middleware.
+	// This middleware must stay first so OPTIONS aborts in the CORS middleware
+	// below still leave the capture populated (unmatched routes stay empty).
+	r.Use(func(c *gin.Context) {
+		if capture := ports.RouteCaptureFrom(c.Request.Context()); capture != nil {
+			capture.Template = c.FullPath()
+		}
+		c.Next()
+	})
 
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")

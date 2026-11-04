@@ -210,19 +210,23 @@ func TestMalformedCacheIsRefetchedAndRedisOutageDoesNotFetch(t *testing.T) {
 	}
 }
 
-func TestInventoryCacheRevisionAndExpiry(t *testing.T) {
+func TestInventoryCacheRevisionExpiryAndOutcomeClassification(t *testing.T) {
 	server, a, b := testCaches(t)
 	ctx := context.Background()
-	result := crawljobs.InventoryResult{Data: []vehicle.NormalizedVehicleListing{{ID: "persisted"}}, Total: 1, Limit: 50}
+	result := crawljobs.InventoryResult{Data: []vehicle.NormalizedVehicleListing{{ID: "persisted"}, {ID: "junk"}}, Total: 2, Limit: 50}
 	a.SetInventory(ctx, "revision-1:query", result)
-	if got, ok := b.GetInventory(ctx, "revision-1:query"); !ok || got.Data[0].ID != "persisted" {
-		t.Fatal("inventory not shared")
+	if got, outcome := b.GetInventory(ctx, "revision-1:query"); outcome != "hit" || got.Data[0].ID != "persisted" {
+		t.Fatalf("inventory not shared: outcome=%s", outcome)
 	}
-	if _, ok := b.GetInventory(ctx, "revision-2:query"); ok {
-		t.Fatal("new revision reused stale inventory")
+	if _, outcome := b.GetInventory(ctx, "revision-2:query"); outcome != "miss" {
+		t.Fatalf("new revision expected miss, got %s", outcome)
+	}
+	server.Set(inventoryKey("revision-3:query"), `{not json`)
+	if _, outcome := b.GetInventory(ctx, "revision-3:query"); outcome != "error" {
+		t.Fatalf("corrupt payload expected error, got %s", outcome)
 	}
 	server.FastForward(2 * time.Minute)
-	if _, ok := b.GetInventory(ctx, "revision-1:query"); ok {
-		t.Fatal("inventory did not expire")
+	if _, outcome := b.GetInventory(ctx, "revision-1:query"); outcome != "miss" {
+		t.Fatalf("inventory did not expire: outcome=%s", outcome)
 	}
 }

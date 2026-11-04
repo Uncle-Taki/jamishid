@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
+
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/application/crawljobs"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"github.com/jackc/pgx/v5"
-	"time"
 )
 
 // knownFacts records only explicit facts; unknown sentinel values never acquire provenance.
@@ -60,26 +61,28 @@ func recordEvent(ctx context.Context, tx pgx.Tx, row vehicle.NormalizedVehicleLi
 	_, err = tx.Exec(ctx, `UPDATE listings SET provenance=CASE WHEN $4='summary' THEN $3::jsonb ELSE provenance||$3::jsonb END WHERE platform=$1 AND id=$2`, row.Platform, row.ID, payload, kind)
 	return err
 }
-func recordSummary(ctx context.Context, tx pgx.Tx, jobID string, observation crawljobs.Observation) error {
+func recordSummary(ctx context.Context, tx pgx.Tx, jobID string, observation crawljobs.Observation) (int64, error) {
 	row := observation.Listing
 	if _, err := tx.Exec(ctx, `UPDATE listings SET availability='active' WHERE platform=$1 AND id=$2`, row.Platform, row.ID); err != nil {
-		return err
+		return 0, err
 	}
 	if err := recordEvent(ctx, tx, row, "summary", 200, "", observation.NeedsDetails); err != nil {
-		return err
+		return 0, err
 	}
 	if !observation.NeedsDetails {
-		return nil
+		return 0, nil
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO detail_tasks(platform,listing_id,summary_hash) VALUES($1,$2,$3) ON CONFLICT(platform,listing_id) DO UPDATE SET summary_hash=EXCLUDED.summary_hash,status=CASE WHEN detail_tasks.status IN ('running','delayed') AND detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.status ELSE 'queued' END,attempts=CASE WHEN detail_tasks.status IN ('running','delayed') AND detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.attempts ELSE 0 END,token=CASE WHEN detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.token ELSE null END,available_at=now(),purpose='enrich'`, row.Platform, row.ID, observation.SummaryHash)
+	if _, err := tx.Exec(ctx, `INSERT INTO detail_tasks(platform,listing_id,summary_hash) VALUES($1,$2,$3) ON CONFLICT(platform,listing_id) DO UPDATE SET summary_hash=EXCLUDED.summary_hash,status=CASE WHEN detail_tasks.status IN ('running','delayed') AND detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.status ELSE 'queued' END,attempts=CASE WHEN detail_tasks.status IN ('running','delayed') AND detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.attempts ELSE 0 END,token=CASE WHEN detail_tasks.summary_hash=EXCLUDED.summary_hash THEN detail_tasks.token ELSE null END,available_at=now(),purpose='enrich'`, row.Platform, row.ID, observation.SummaryHash); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM crawler_retries WHERE kind='detail' AND platform=$1 AND listing_id=$2 AND summary_hash<>$3`, row.Platform, row.ID, observation.SummaryHash)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if _, err = tx.Exec(ctx, `DELETE FROM crawler_retries WHERE kind='detail' AND platform=$1 AND listing_id=$2 AND summary_hash<>$3`, row.Platform, row.ID, observation.SummaryHash); err != nil {
-		return err
+	if _, err = tx.Exec(ctx, `INSERT INTO job_details VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, jobID, row.Platform, row.ID); err != nil {
+		return 0, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO job_details VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, jobID, row.Platform, row.ID)
-	return err
+	return tag.RowsAffected(), nil
 }
 func (s *Store) ClaimDetail(ctx context.Context) (crawljobs.DetailTask, bool, error) {
 	tx, err := s.Pool.Begin(ctx)
@@ -146,6 +149,7 @@ func (s *Store) CompleteDetail(ctx context.Context, task crawljobs.DetailTask, r
 	}
 	state := "complete"
 	available := "active"
+	ticketScheduled := false
 	if failure != "" {
 		available = ""
 		if code == 404 || code == 410 {
@@ -158,6 +162,7 @@ func (s *Store) CompleteDetail(ctx context.Context, task crawljobs.DetailTask, r
 	}
 	if state == "failed" && transientRetry(failure, code) {
 		state = "delayed"
+		ticketScheduled = true
 		if err = s.enqueueRetry(ctx, tx, "detail", string(task.Listing.Platform), task.Listing.ID, task.Hash, failure); err != nil {
 			return err
 		}
@@ -190,7 +195,13 @@ func (s *Store) CompleteDetail(ctx context.Context, task crawljobs.DetailTask, r
 	if err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	if ticketScheduled {
+		s.metrics().RetryScheduled("detail")
+	}
+	return nil
 }
 
 // Reverification is bounded and never infers removal from absence in search pages.

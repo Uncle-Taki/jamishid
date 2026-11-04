@@ -2,17 +2,19 @@ package telemetry
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
@@ -21,20 +23,44 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// Histogram buckets shared by operation and HTTP duration series.
 var bounds = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 15, 30, 60}
 
-type series struct {
-	labels          string
-	count, listings uint64
-	sum             float64
-	buckets         []uint64
-}
+// operationLabels preserves the legacy exposition contract exactly:
+// jamshid_operation_duration_seconds{operation,source,outcome,failure,cache,status}.
+var operationLabels = []string{"operation", "source", "outcome", "failure", "cache", "status"}
+
 type Observer struct {
-	mu       sync.Mutex
-	series   map[string]*series
 	tracer   trace.Tracer
 	provider *sdktrace.TracerProvider
 	logger   *slog.Logger
+
+	registry *prometheus.Registry
+
+	operations *prometheus.HistogramVec
+	listings   *prometheus.CounterVec
+
+	httpRequests *prometheus.CounterVec
+	httpDuration *prometheus.HistogramVec
+	httpInFlight prometheus.Gauge
+
+	workerCapacity    *prometheus.GaugeVec
+	workerActive      *prometheus.GaugeVec
+	workerAttempts    *prometheus.CounterVec
+	workerDuration    *prometheus.HistogramVec
+	workerClaimErrors *prometheus.CounterVec
+	workerLoopTick    *prometheus.GaugeVec
+	workerCompleted   *prometheus.GaugeVec
+	schedulerAttempt  *prometheus.GaugeVec
+	schedulerSuccess  *prometheus.GaugeVec
+	schedulerErrors   *prometheus.CounterVec
+
+	retryTickets      *prometheus.CounterVec
+	inventoryCache    *prometheus.CounterVec
+	inventoryQueries  prometheus.Counter
+	postgresPoolConns *prometheus.GaugeVec
+	postgresPoolMax   prometheus.Gauge
+	snapshotCollector *snapshotCollector
 }
 
 // JSON span output can be redirected to a file alongside the structured event log.
@@ -44,9 +70,126 @@ func New(logs io.Writer, traces io.Writer) (*Observer, error) {
 		return nil, err
 	}
 	provider := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter), sdktrace.WithResource(resource.NewSchemaless(attribute.String("service.name", "jamshid-backend"))))
-	return &Observer{series: map[string]*series{}, tracer: provider.Tracer("jamshid"), provider: provider, logger: slog.New(slog.NewJSONHandler(logs, nil))}, nil
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+	o := &Observer{
+		tracer:   provider.Tracer("jamshid"),
+		provider: provider,
+		logger:   slog.New(slog.NewJSONHandler(logs, nil)),
+		registry: registry,
+	}
+	o.operations = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "jamshid_operation_duration_seconds",
+		Help:    "Operation duration by source and cache state.",
+		Buckets: bounds,
+	}, operationLabels)
+	o.listings = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "jamshid_valid_listings_total",
+		Help: "Valid listings returned by operation.",
+	}, operationLabels)
+	o.httpRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "jamshid_http_requests_total",
+		Help: "HTTP requests by normalized route template, method and status class.",
+	}, []string{"route", "method", "status_class"})
+	o.httpDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "jamshid_http_request_duration_seconds",
+		Help:    "HTTP request duration by normalized route template and method.",
+		Buckets: bounds,
+	}, []string{"route", "method"})
+	o.httpInFlight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "jamshid_http_requests_in_flight",
+		Help: "HTTP requests currently being served.",
+	})
+	o.workerCapacity = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "jamshid_worker_capacity",
+		Help: "Configured worker loops per pool.",
+	}, []string{"pool"})
+	o.workerActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "jamshid_worker_active",
+		Help: "Worker loops currently processing a claimed task.",
+	}, []string{"pool"})
+	o.workerAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "jamshid_worker_task_attempts_total",
+		Help: "Worker task attempts (not unique listings) by pool, source, outcome and failure kind.",
+	}, []string{"pool", "source", "outcome", "failure"})
+	o.workerDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "jamshid_worker_task_duration_seconds",
+		Help:    "Worker task attempt duration by pool.",
+		Buckets: bounds,
+	}, []string{"pool"})
+	o.workerClaimErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "jamshid_worker_claim_errors_total",
+		Help: "Task claim failures, reported even when no task was acquired.",
+	}, []string{"pool"})
+	o.workerLoopTick = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "jamshid_worker_loop_last_tick_timestamp_seconds",
+		Help: "Unix timestamp of the last actual loop iteration, including idle polls.",
+	}, []string{"pool", "loop"})
+	o.workerCompleted = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "jamshid_worker_last_completed_timestamp_seconds",
+		Help: "Unix timestamp of the last successfully committed task.",
+	}, []string{"pool"})
+	o.schedulerAttempt = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "jamshid_scheduler_last_attempt_timestamp_seconds",
+		Help: "Unix timestamp of the last scheduler cycle attempt.",
+	}, []string{"scheduler"})
+	o.schedulerSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "jamshid_scheduler_last_success_timestamp_seconds",
+		Help: "Unix timestamp of the last successful scheduler cycle.",
+	}, []string{"scheduler"})
+	o.schedulerErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "jamshid_scheduler_errors_total",
+		Help: "Scheduler cycle failures.",
+	}, []string{"scheduler"})
+	o.retryTickets = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "jamshid_retry_tickets_total",
+		Help: "Durable retry ticket transitions counted after successful persistence.",
+	}, []string{"kind", "action"})
+	o.inventoryCache = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "jamshid_inventory_cache_requests_total",
+		Help: "Inventory cache lookups by outcome: hit, miss, error or bypass.",
+	}, []string{"outcome"})
+	o.inventoryQueries = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "jamshid_inventory_queries_total",
+		Help: "Inventory searches served from PostgreSQL.",
+	})
+	o.postgresPoolConns = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "jamshid_postgres_pool_connections",
+		Help: "Application PostgreSQL pool connections by state.",
+	}, []string{"state"})
+	o.postgresPoolMax = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "jamshid_postgres_pool_max_connections",
+		Help: "Application PostgreSQL pool size limit.",
+	})
+	o.snapshotCollector = newSnapshotCollector()
+	registry.MustRegister(
+		o.operations, o.listings,
+		o.httpRequests, o.httpDuration, o.httpInFlight,
+		o.workerCapacity, o.workerActive, o.workerAttempts, o.workerDuration,
+		o.workerClaimErrors, o.workerLoopTick, o.workerCompleted,
+		o.schedulerAttempt, o.schedulerSuccess, o.schedulerErrors,
+		o.retryTickets, o.inventoryCache, o.inventoryQueries,
+		o.postgresPoolConns, o.postgresPoolMax,
+		o.snapshotCollector,
+	)
+	return o, nil
 }
+
 func (o *Observer) Shutdown(ctx context.Context) error { return o.provider.Shutdown(ctx) }
+
+// Registry exposes the process-wide Prometheus registry for additional collectors.
+func (o *Observer) Registry() *prometheus.Registry { return o.registry }
+
+// ObservePostgresPool records current application pool statistics; it is cheap
+// and called periodically from main wiring and tests.
+func (o *Observer) ObservePostgresPool(acquired, idle, max int32) {
+	o.postgresPoolConns.WithLabelValues("acquired").Set(float64(acquired))
+	o.postgresPoolConns.WithLabelValues("idle").Set(float64(idle))
+	o.postgresPoolMax.Set(float64(max))
+}
 
 func (o *Observer) Start(ctx context.Context, operation string, platform vehicle.Platform) (context.Context, func(ports.Observation)) {
 	start := time.Now()
@@ -70,60 +213,67 @@ func (o *Observer) Start(ctx context.Context, operation string, platform vehicle
 			}
 			elapsed := time.Since(start).Seconds()
 			// Labels contain only controlled categories: no query, item URL, cursor or ID.
-			labels := fmt.Sprintf("operation=%q,source=%q,outcome=%q,failure=%q,cache=%q,status=%q", operation, platform, outcome, failure, event.Cache, fmt.Sprint(event.StatusCode))
-			o.mu.Lock()
-			s := o.series[labels]
-			if s == nil {
-				s = &series{labels: labels, buckets: make([]uint64, len(bounds))}
-				o.series[labels] = s
-			}
-			s.count++
-			s.sum += elapsed
-			s.listings += uint64(max(0, event.Listings))
-			for i, b := range bounds {
-				if elapsed <= b {
-					s.buckets[i]++
-				}
-			}
-			o.mu.Unlock()
+			o.operations.WithLabelValues(operation, string(platform), outcome, failure, event.Cache, strconv.Itoa(event.StatusCode)).Observe(elapsed)
+			o.listings.WithLabelValues(operation, string(platform), outcome, failure, event.Cache, strconv.Itoa(event.StatusCode)).Add(float64(max(0, event.Listings)))
 			o.logger.Info("operation completed", "operation", operation, "source", platform, "outcome", outcome, "failure", failure, "cache", event.Cache, "status", event.StatusCode, "duration_seconds", elapsed, "listings", event.Listings, "trace_id", span.SpanContext().TraceID().String())
 		})
 	}
 }
 
 func (o *Observer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	io.WriteString(w, "# HELP jamshid_operation_duration_seconds Operation duration by source and cache state.\n# TYPE jamshid_operation_duration_seconds histogram\n# HELP jamshid_valid_listings_total Valid listings returned by operation.\n# TYPE jamshid_valid_listings_total counter\n")
-	keys := make([]string, 0, len(o.series))
-	for key := range o.series {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		s := o.series[key]
-		for i, b := range bounds {
-			fmt.Fprintf(w, "jamshid_operation_duration_seconds_bucket{%s,le=%q} %d\n", s.labels, fmt.Sprint(b), s.buckets[i])
-		}
-		fmt.Fprintf(w, "jamshid_operation_duration_seconds_bucket{%s,le=\"+Inf\"} %d\n", s.labels, s.count)
-		fmt.Fprintf(w, "jamshid_operation_duration_seconds_sum{%s} %g\njamshid_operation_duration_seconds_count{%s} %d\njamshid_valid_listings_total{%s} %d\n", s.labels, s.sum, s.labels, s.count, s.labels, s.listings)
-	}
+	promhttp.HandlerFor(o.registry, promhttp.HandlerOpts{}).ServeHTTP(w, r)
 }
 
+// HTTP wraps an HTTP handler with request metrics. Normalized routes come from
+// ports.RouteCapture (set by the router middleware after route matching); see
+// router.go. Legacy operation classification is preserved unchanged.
 func (o *Observer) HTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		route := r.URL.Path
-		switch route {
+		capture := &ports.RouteCapture{}
+		r = r.WithContext(ports.WithRouteCapture(r.Context(), capture))
+		start := time.Now()
+		o.httpInFlight.Inc()
+		defer o.httpInFlight.Dec()
+		// Legacy four-path classification, preserved verbatim.
+		legacy := r.URL.Path
+		switch legacy {
 		case "/api/v1/crawl", "/api/v1/listing", "/api/v1/categories", "/api/v1/health":
 		default:
-			route = "other"
+			legacy = "other"
 		}
-		ctx, finish := o.Start(r.Context(), "http"+strings.ReplaceAll(route, "/", "_"), "")
+		ctx, finish := o.Start(r.Context(), "http"+strings.ReplaceAll(legacy, "/", "_"), "")
 		recorder := &statusWriter{ResponseWriter: w, status: 200}
 		next.ServeHTTP(recorder, r.WithContext(ctx))
 		finish(ports.Observation{StatusCode: recorder.status})
+		route := capture.Template
+		if route == "" {
+			switch {
+			case r.Method == http.MethodOptions:
+				route = "preflight"
+			case recorder.status == http.StatusMethodNotAllowed:
+				route = "method_not_allowed"
+			default:
+				route = "unmatched"
+			}
+		}
+		o.httpRequests.WithLabelValues(route, r.Method, statusClass(recorder.status)).Inc()
+		o.httpDuration.WithLabelValues(route, r.Method).Observe(time.Since(start).Seconds())
 	})
+}
+
+func statusClass(code int) string {
+	switch {
+	case code >= 200 && code < 300:
+		return "2xx"
+	case code >= 300 && code < 400:
+		return "3xx"
+	case code >= 400 && code < 500:
+		return "4xx"
+	case code >= 500 && code < 600:
+		return "5xx"
+	default:
+		return "other"
+	}
 }
 
 type statusWriter struct {
