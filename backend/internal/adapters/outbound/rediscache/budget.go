@@ -20,7 +20,7 @@ func budgetKeys(source string) []string {
 }
 func (c *Cache) Wait(ctx context.Context, source string) error {
 	for {
-		delay, err := budgetWait.Run(ctx, c.client, budgetKeys(source), max(250, budgetFloor.Load())).Int64()
+		delay, err := runScript(ctx, budgetWait, c.client, budgetKeys(source), max(250, budgetFloor.Load())).Int64()
 		if err != nil {
 			return err
 		}
@@ -38,8 +38,8 @@ func (c *Cache) Wait(ctx context.Context, source string) error {
 }
 func (c *Cache) Backoff(ctx context.Context, source string, delay int64) error {
 	keys := budgetKeys(source)
-	return budgetBackoff.Run(ctx, c.client, []string{keys[0], keys[2]}, delay).Err()
+	return runScript(ctx, budgetBackoff, c.client, []string{keys[0], keys[2]}, delay).Err()
 }
 func (c *Cache) Success(ctx context.Context, source string) error {
-	return budgetSuccess.Run(ctx, c.client, []string{budgetKeys(source)[2]}).Err()
+	return runScript(ctx, budgetSuccess, c.client, []string{budgetKeys(source)[2]}).Err()
 }

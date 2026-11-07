@@ -34,6 +34,7 @@ func New(ctx context.Context, url string) (*Store, error) {
 		return nil, errors.New("invalid DATABASE_URL")
 	}
 	config.MaxConns = 10
+	config.ConnConfig.Tracer = queryTracer{}
 	config.ConnConfig.ConnectTimeout = 5 * time.Second
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
@@ -50,6 +51,34 @@ func New(ctx context.Context, url string) (*Store, error) {
 	return store, nil
 }
 func (s *Store) Close() { s.Pool.Close() }
+
+// NewMonitoring opens a small dedicated read-only pool for the snapshot
+// collector. It never runs migrations (the application pool owns the schema)
+// and is capped at two connections so monitoring scans cannot exhaust the
+// application pool. The pool's lifetime belongs to the collector: the caller
+// must Close it when the collector stops.
+func NewMonitoring(ctx context.Context, url string) (*Store, error) {
+	config, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, errors.New("invalid DATABASE_URL")
+	}
+	config.MaxConns = 2
+	config.ConnConfig.Tracer = queryTracer{}
+	config.MinConns = 0
+	config.ConnConfig.ConnectTimeout = 5 * time.Second
+	// Every monitoring query is a read; enforce it at the session level so a
+	// future monitoring query can never write application state.
+	config.ConnConfig.RuntimeParams["default_transaction_read_only"] = "true"
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	if err = pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &Store{Pool: pool}, nil
+}
 func (s *Store) Migrate(ctx context.Context) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -362,7 +391,7 @@ func (s *Store) Commit(ctx context.Context, task crawljobs.Task, observations []
 		return err
 	}
 	if invalidatedTickets > 0 {
-		s.metrics().RetryInvalidated("detail")
+		s.metrics().RetryInvalidated("detail", invalidatedTickets)
 	}
 	return nil
 }
@@ -728,7 +757,7 @@ func (s *Store) Search(ctx context.Context, q crawljobs.InventoryQuery) (crawljo
 		return result, err
 	}
 	if s.InventoryCache != nil {
-		s.InventoryCache.SetInventory(ctx, cacheKey, result)
+		s.metrics().InventoryCacheWrite(s.InventoryCache.SetInventory(ctx, cacheKey, result))
 	}
 	return result, nil
 }

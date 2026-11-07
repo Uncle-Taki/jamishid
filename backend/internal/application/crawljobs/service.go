@@ -61,7 +61,11 @@ type InventoryCache interface {
 	// GetInventory returns the cached result and a bounded outcome:
 	// "hit", "miss" or "error".
 	GetInventory(context.Context, string) (InventoryResult, string)
-	SetInventory(context.Context, string, InventoryResult)
+	// SetInventory stores the result and returns a bounded write outcome
+	// ("ok"/"error") so noeviction and write failures stay observable; the
+	// fallback semantics on failure are unchanged (the caller serves the
+	// freshly computed result either way).
+	SetInventory(context.Context, string, InventoryResult) string
 }
 type Repository interface {
 	Submit(context.Context, vehicle.SearchCriteria, bool) (Job, error)
@@ -122,7 +126,17 @@ func SummaryHash(row vehicle.NormalizedVehicleListing) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Service) WorkOne(ctx context.Context) (bool, error) {
+func (s *Service) WorkOne(ctx context.Context) (worked bool, workErr error) {
+	ctx = ports.DiagnosticScope(ctx)
+	defer func() {
+		if !ports.DiagnosticRecorded(ctx) {
+			d := ports.Diagnostic{Component: "worker", Operation: "page.work"}
+			if errors.Is(workErr, ErrLeaseLost) {
+				d.ErrorClass = "lease_lost"
+			}
+			ports.ReportDiagnostic(ctx, d, workErr)
+		}
+	}()
 	metrics := workerMetrics(s.Metrics)
 	task, ok, err := s.Store.Claim(ctx)
 	if err != nil {
@@ -217,12 +231,14 @@ func (s *Service) Run(ctx context.Context, report func(error)) {
 	schedule := time.NewTicker(time.Minute)
 	defer schedule.Stop()
 	for {
+		ctx := ports.DiagnosticScope(ctx)
 		metrics.LoopTick("page", loop)
 		select {
 		case <-schedule.C:
 			finishSchedule := metrics.ScheduleAttempt("schedule")
 			err := s.Store.Schedule(ctx)
 			finishSchedule(err)
+			ports.ReportDiagnostic(ctx, ports.Diagnostic{Component: "scheduler", Operation: "schedule"}, err)
 			if err != nil {
 				report(err)
 			}
@@ -246,6 +262,7 @@ func (s *Service) Run(ctx context.Context, report func(error)) {
 			finishSchedule := metrics.ScheduleAttempt("schedule")
 			err := s.Store.Schedule(ctx)
 			finishSchedule(err)
+			ports.ReportDiagnostic(ctx, ports.Diagnostic{Component: "scheduler", Operation: "schedule"}, err)
 			if err != nil {
 				report(err)
 			}

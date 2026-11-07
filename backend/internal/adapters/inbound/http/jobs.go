@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/application/crawljobs"
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"github.com/gin-gonic/gin"
 )
@@ -23,6 +24,7 @@ func jobError(c *gin.Context, err error) {
 	if errors.Is(err, crawljobs.ErrNotFound) {
 		c.JSON(404, gin.H{"error": "Crawl job not found"})
 	} else {
+		ports.ReportDiagnostic(c.Request.Context(), ports.Diagnostic{Component: "http", Operation: c.Request.Method + " " + c.FullPath()}, err)
 		c.JSON(503, gin.H{"error": "Stored crawl service unavailable"})
 	}
 }

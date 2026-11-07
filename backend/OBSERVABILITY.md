@@ -34,7 +34,7 @@ Structured JSON completion events and OpenTelemetry JSON spans go to backend std
 
 The `/metrics` listener stays on `127.0.0.1:9090` (same port as before) and is now served by the official Prometheus client through a single registry. Request instrumentation uses Gin route-template normalization, so parameterized routes collapse to their templates (for example `/api/v1/jobs/:id`) and cardinality stays bounded:
 
-- `jamshid_http_requests_total{route,method,status_class}` — requests counted against the matched route template; `OPTIONS` is normalized to `preflight`, HTTP 405 to `method_not_allowed`, and unmatched paths to `unmatched`.
+- `jamshid_http_requests_total{route,method,status_class}` — requests counted against the matched route template; `OPTIONS` is normalized to `preflight`, HTTP 405 to `method_not_allowed`, unmatched paths to `unmatched`, and unexpected or arbitrary methods (anything outside the well-known verb set) to `method="other"`, so probe traffic cannot create unbounded label values.
 - `jamshid_http_request_duration_seconds{route,method}` — request latency histogram.
 - `jamshid_http_requests_in_flight` — requests currently being served.
 
@@ -46,23 +46,32 @@ The worker process (and any process running the crawl loops) exports:
 
 - Pool capacity and active gauges (`jamshid_worker_capacity`, `jamshid_worker_active` per `pool`); the active gauge is decremented on every task exit path, so it cannot leak.
 - Task attempts by outcome (`jamshid_worker_task_attempts_total{pool,source,outcome,failure}`): `success`, `source_failure`, `deferral`, `lease_lost`, `persistence_failure`, `canceled`. Success is only counted after the database commit, so a crash between fetch and commit does not inflate it. These are attempts, not unique listings.
-- Loop heartbeat timestamps (`jamshid_worker_loop_last_tick_timestamp_seconds{pool,loop}`) updated on every actual loop iteration, including idle polls where no task is claimed.
+- Loop heartbeat timestamps (`jamshid_worker_loop_last_tick_timestamp_seconds{pool,loop}`) updated on every actual loop iteration, including idle polls where no task was claimed.
+- Zero-state initialization: setting pool capacity (`SetWorkerCapacity`) initializes `active=0` and `completed=0` series, so a healthy idle pool is visibly zero rather than absent (absent means never started).
+- Inventory cache *writes* (`jamshid_inventory_cache_writes_total{outcome=ok|error}`). Redis `SET` failures were previously invisible; they still never change API behavior (the read path already falls back), but noeviction/full-Redis conditions are now observable alongside the existing read-side `hit`/`miss`/`error`/`bypass` counts.
 - Scheduler attempt/success timestamps and error counters (`jamshid_scheduler_*` per `scheduler`), and claim errors (`jamshid_worker_claim_errors_total{pool}`) reported even when no task was claimed.
+- Retry ticket counters (`jamshid_retry_tickets_total{kind,action}`) count actual tickets: a page commit invalidating three tickets increments `invalidated{detail}=3`, not `1`, and `discarded` counts only deletes that actually removed a ticket.
 
 ## Shared snapshot collector
 
-Queue, inventory, coverage, proxy and dependency gauges describe the whole system, so exactly one process must collect them. `JAMSHID_MONITORING_COLLECTOR=1` designates that collector — in Compose this is the backend API service. The collector polls PostgreSQL and Redis every `JAMSHID_MONITORING_INTERVAL` (default `15s`) with a bounded timeout per poll; polls never overlap. When a poll fails, the last-good values are retained and staleness is marked conspicuously through `jamshid_monitoring_snapshot_success=0` (never by zeroing values). All shared gauges carry the label `collector="primary"` and must never be summed across instances. The `/metrics` endpoint never queries the database synchronously.
+Queue, inventory, coverage, proxy and dependency gauges describe the whole system, so exactly one process must collect them. `JAMSHID_MONITORING_COLLECTOR=1` designates that collector — in Compose this is the backend API service. The collector polls PostgreSQL and Redis every `JAMSHID_MONITORING_INTERVAL` (default `15s`) with a bounded timeout per poll; polls never overlap. When a poll fails, the last-good *measurements* are retained and staleness is marked conspicuously through `jamshid_monitoring_snapshot_success=0` (never by zeroing values). Dependency availability (`jamshid_postgres_up`, `jamshid_redis_up`) is deliberately **not** retained: it follows the latest poll attempt, so an outage flips it to `0` immediately while retained measurements stay visible, and even a first-ever failed poll (no last-good data at all) still serves dependency health. All shared gauges carry the label `collector="primary"` and must never be summed across instances. The `/metrics` endpoint never queries the database synchronously.
+
+The collector runs its queries on a dedicated read-only monitoring pool (`postgres.NewMonitoring`: max two connections, `default_transaction_read_only` set, migrations never re-run, pool closed with the collector), so monitoring scans cannot exhaust the API handler pool.
 
 Queue-semantics notes for reading `jamshid_queue_tasks{queue,source,state,mode,purpose}`:
 
 - A delayed task and its retry ticket describe the same pending work; never sum the two.
+- `ready` and `running_expired` follow the exact predicates the workers' claim queries use (including parent-job eligibility). Tasks that exist but are not runnable under those rules — a queued task under a terminal (failed/complete/partial) parent job, or a `running` row without a lease — are classified `blocked` instead of being reported ready. A behavioral regression test compares the classification against the real `Claim`/`ClaimDetail` queries for every parent-status/task-state combination.
 - Paused parent tasks are excluded from the `ready` count.
-- Running work is split into `running_valid` and `running_expired` leases.
+- Running work (under an eligible parent) is split into `running_valid` and `running_expired` leases.
+- A drained queue serves real `0` series (initialized on every poll), so an empty panel reliably means no data rather than no work.
 - `jamshid_queue_oldest_ready_age_seconds` measures overdue eligibility, not how long ago work was enqueued; `0` means the queue is empty.
 
 ## Dashboards and alerts
 
 Grafana and Prometheus run under the optional monitoring profile (`build/compose.yaml`, profile `monitoring`), with Grafana on `127.0.0.1:3001` and Prometheus on `127.0.0.1:9091`. Four dashboards are provisioned from `build/monitoring/grafana/` along with the Prometheus datasource; alert rules live in `build/monitoring/prometheus/rules/alerts.yaml` and are evaluated locally by Prometheus — no notifications are delivered. Operator documentation, including the full metrics reference and troubleshooting, is in `build/monitoring/README.md`.
+
+The optional `resources` profile additionally runs a native container-resource exporter (`cmd/dockermetrics`, behind the `resources` Compose profile). It reads the Docker Engine API through a read-only socket mount, exports per-container CPU/memory/network usage labeled by `project`/`service`/`container`/`state`, and scopes its export to one Compose project (`JAMSHID_DOCKER_PROJECT`, default `jamshid`; `all` disables the filter) so unrelated projects and same-named services are never mixed. Disk usage is reported by host-wide scope (`image_layers_unique`, `containers_rw`, `volumes`) and is never summed. Partial collection failures (a stopped container whose stats call fails) increment `jamshid_docker_stats_errors_total{container}` and `jamshid_docker_stats_failed` without failing the poll; a broken Docker API drives `jamshid_docker_exporter_up=0`. Both cases have alert rules — a responsive exporter cannot look healthy while its data is frozen.
 
 ## Worker environment knobs
 

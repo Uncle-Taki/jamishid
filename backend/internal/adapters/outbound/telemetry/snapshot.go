@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -49,20 +50,38 @@ type RedisService struct {
 	Up                             bool
 	UsedMemory, MaxMemory          float64
 	Hits, Misses, Evicted, Clients float64
+	// WriteOK is the per-poll probe result: the instance answered and also
+	// accepted a representative 64 KiB SET. A full instance under noeviction reports Up while
+	// WriteOK is false, so memory pressure is visible without parsing logs.
+	WriteOK bool
 }
 
 // Snapshot is the complete shared state collected by the designated collector.
 type Snapshot struct {
-	TakenAt         time.Time
-	QueueTasks      []QueueRow
-	OldestReady     []AgeRow
-	RetryNextDue    []AgeRow // Seconds is a unix timestamp; 0 = none scheduled
-	Inventory       []InventoryRow
-	Coverage        []CoverageRow
-	Proxies         []QueueRow // State carries the proxy pool state
-	Postgres        PostgresService
-	Redis           RedisService
-	BudgetCooldowns []AgeRow
+	TakenAt time.Time
+	// PostgresHealthKnown/RedisHealthKnown mark that this snapshot carries a
+	// current dependency availability observation from its own poll attempt,
+	// even when the poll failed overall. When known, the Up flags reflect the
+	// latest attempt (not last-good) so an outage reads as an outage while the
+	// measurement values stay last-good.
+	PostgresHealthKnown bool
+	RedisHealthKnown    bool
+	// PostgresObserved/RedisObserved mark that this snapshot carries actual
+	// dependency measurement values (transactions, connections, storage,
+	// memory, cache counters). A poll that only observed availability (a failed
+	// probe) does NOT set these, so the collector never advertises fabricated
+	// zero usage for a dependency it could not read (review finding C3).
+	PostgresObserved bool
+	RedisObserved    bool
+	QueueTasks       []QueueRow
+	OldestReady      []AgeRow
+	RetryNextDue     []AgeRow // Seconds is a unix timestamp; 0 = none scheduled
+	Inventory        []InventoryRow
+	Coverage         []CoverageRow
+	Proxies          []QueueRow // State carries the proxy pool state
+	Postgres         PostgresService
+	Redis            RedisService
+	BudgetCooldowns  []AgeRow
 }
 
 // SnapshotSource produces snapshots; it must be safe for concurrent use and
@@ -107,6 +126,7 @@ var (
 	pgXactDesc         = snapshotDesc("jamshid_postgres_xact_total", "PostgreSQL transactions by outcome since server start.", "outcome")
 	pgStorageDesc      = snapshotDesc("jamshid_storage_bytes", "Storage used by scope.", "scope")
 	redisUpDesc        = snapshotDesc("jamshid_redis_up", "1 when the last Redis snapshot poll succeeded.")
+	redisWriteOKDesc   = snapshotDesc("jamshid_redis_write_accepts", "1 when the latest Redis poll accepted a 64 KiB canary SET; 0 when that poll failed or the canary was rejected. Not a guarantee for other writes.")
 	redisMemoryDesc    = snapshotDesc("jamshid_redis_memory_used_bytes", "Redis used memory.")
 	redisMaxMemoryDesc = snapshotDesc("jamshid_redis_memory_max_bytes", "Redis max memory limit (0 when unlimited).")
 	redisHitsDesc      = snapshotDesc("jamshid_redis_keyspace_hits_total", "Redis keyspace hits since server start.")
@@ -122,7 +142,7 @@ var (
 )
 
 func (c *snapshotCollector) Describe(ch chan<- *prometheus.Desc) {
-	for _, desc := range []*prometheus.Desc{queueDesc, oldestReadyDesc, retryNextDueDesc, inventoryDesc, coverageDesc, coverageErrorDesc, coverageLastDesc, proxyDesc, postgresUpDesc, pgConnectionsDesc, pgXactDesc, pgStorageDesc, redisUpDesc, redisMemoryDesc, redisMaxMemoryDesc, redisHitsDesc, redisMissesDesc, redisEvictedDesc, redisClientsDesc, budgetCooldownDesc, snapshotSuccessDesc, snapshotLastGoodDesc, snapshotDurationDesc, snapshotErrorsDesc} {
+	for _, desc := range []*prometheus.Desc{queueDesc, oldestReadyDesc, retryNextDueDesc, inventoryDesc, coverageDesc, coverageErrorDesc, coverageLastDesc, proxyDesc, postgresUpDesc, pgConnectionsDesc, pgXactDesc, pgStorageDesc, redisUpDesc, redisWriteOKDesc, redisMemoryDesc, redisMaxMemoryDesc, redisHitsDesc, redisMissesDesc, redisEvictedDesc, redisClientsDesc, budgetCooldownDesc, snapshotSuccessDesc, snapshotLastGoodDesc, snapshotDurationDesc, snapshotErrorsDesc} {
 		ch <- desc
 	}
 }
@@ -180,26 +200,43 @@ func (c *snapshotCollector) Collect(ch chan<- prometheus.Metric) {
 	if snap.Postgres.Up {
 		up = 1
 	}
-	emit(postgresUpDesc, prometheus.GaugeValue, up)
-	for state, v := range snap.Postgres.Connections {
-		emit(pgConnectionsDesc, prometheus.GaugeValue, v, state)
+	// Availability is exported whenever this poll observed it; the
+	// measurement values (transactions, connections, storage) are exported only
+	// when they were actually read, so a down/unobserved database is never
+	// advertised as having zero activity (review finding C3).
+	if snap.PostgresHealthKnown {
+		emit(postgresUpDesc, prometheus.GaugeValue, up)
 	}
-	emit(pgXactDesc, prometheus.CounterValue, snap.Postgres.XactCommit, "commit")
-	emit(pgXactDesc, prometheus.CounterValue, snap.Postgres.XactRollback, "rollback")
-	for scope, v := range snap.Postgres.Storage {
-		emit(pgStorageDesc, prometheus.GaugeValue, v, scope)
+	if snap.PostgresObserved {
+		for state, v := range snap.Postgres.Connections {
+			emit(pgConnectionsDesc, prometheus.GaugeValue, v, state)
+		}
+		emit(pgXactDesc, prometheus.CounterValue, snap.Postgres.XactCommit, "commit")
+		emit(pgXactDesc, prometheus.CounterValue, snap.Postgres.XactRollback, "rollback")
+		for scope, v := range snap.Postgres.Storage {
+			emit(pgStorageDesc, prometheus.GaugeValue, v, scope)
+		}
 	}
 	up = 0.0
 	if snap.Redis.Up {
 		up = 1
 	}
-	emit(redisUpDesc, prometheus.GaugeValue, up)
-	emit(redisMemoryDesc, prometheus.GaugeValue, snap.Redis.UsedMemory)
-	emit(redisMaxMemoryDesc, prometheus.GaugeValue, snap.Redis.MaxMemory)
-	emit(redisHitsDesc, prometheus.CounterValue, snap.Redis.Hits)
-	emit(redisMissesDesc, prometheus.CounterValue, snap.Redis.Misses)
-	emit(redisEvictedDesc, prometheus.CounterValue, snap.Redis.Evicted)
-	emit(redisClientsDesc, prometheus.GaugeValue, snap.Redis.Clients)
+	if snap.RedisHealthKnown {
+		emit(redisUpDesc, prometheus.GaugeValue, up)
+		writeOK := 0.0
+		if snap.Redis.WriteOK {
+			writeOK = 1
+		}
+		emit(redisWriteOKDesc, prometheus.GaugeValue, writeOK)
+	}
+	if snap.RedisObserved {
+		emit(redisMemoryDesc, prometheus.GaugeValue, snap.Redis.UsedMemory)
+		emit(redisMaxMemoryDesc, prometheus.GaugeValue, snap.Redis.MaxMemory)
+		emit(redisHitsDesc, prometheus.CounterValue, snap.Redis.Hits)
+		emit(redisMissesDesc, prometheus.CounterValue, snap.Redis.Misses)
+		emit(redisEvictedDesc, prometheus.CounterValue, snap.Redis.Evicted)
+		emit(redisClientsDesc, prometheus.GaugeValue, snap.Redis.Clients)
+	}
 	for _, row := range snap.BudgetCooldowns {
 		emit(budgetCooldownDesc, prometheus.GaugeValue, row.Seconds, row.Source)
 	}
@@ -208,15 +245,52 @@ func (c *snapshotCollector) Collect(ch chan<- prometheus.Metric) {
 // store replaces the served snapshot atomically; obsolete label series disappear.
 func (c *snapshotCollector) store(snap *Snapshot) { c.current.Store(snap) }
 
+// mergeDependencyHealth overlays the latest observed dependency availability
+// onto the last-good snapshot (a copy) so a down database reads as down while
+// every measurement stays last-good. Flags that the failed attempt could not
+// observe stay last-good (unknown is not reported as either state).
+func (c *snapshotCollector) mergeDependencyHealth(partial Snapshot) {
+	if old := c.current.Load(); old != nil {
+		merged := *old
+		if partial.PostgresHealthKnown {
+			merged.Postgres.Up = partial.Postgres.Up
+			merged.PostgresHealthKnown = true
+			// A failed probe cannot have read measurements; the merged snapshot
+			// keeps the prior success's observed values (last-good), so the
+			// observed flag is whatever the last good poll established.
+		}
+		if partial.RedisHealthKnown {
+			merged.Redis.Up = partial.Redis.Up
+			merged.Redis.WriteOK = partial.Redis.WriteOK
+			merged.RedisHealthKnown = true
+		}
+		// Redis is an independent probe: keep its current measurements even
+		// when the PostgreSQL snapshot failed, including first Redis recovery.
+		if partial.RedisObserved && partial.Redis.Up {
+			merged.Redis = partial.Redis
+			merged.RedisObserved = true
+			merged.BudgetCooldowns = partial.BudgetCooldowns
+		}
+		c.current.Store(&merged)
+		return
+	}
+	// First-ever poll failed: no last-good measurements exist. Serve the
+	// partial snapshot so the known dependency flags (down) are visible as
+	// real 0 values instead of absent series reading as "no collector".
+	c.current.Store(&partial)
+}
+
 // RunSnapshotCollector polls the source on a bounded interval until ctx is
 // canceled. Polls never overlap; each poll has its own timeout. Failed polls
 // retain the last-good snapshot and mark staleness through
 // jamshid_monitoring_snapshot_success=0; values are never replaced with zeros.
 // Poll-health metrics are exported with the collector label only by the
 // process running this collector.
-func (o *Observer) RunSnapshotCollector(ctx context.Context, source SnapshotSource, interval, timeout time.Duration) {
+func (o *Observer) RunSnapshotCollector(ctx context.Context, source SnapshotSource, interval, timeout time.Duration) <-chan struct{} {
+	done := make(chan struct{})
 	if source == nil {
-		return
+		close(done)
+		return done
 	}
 	if interval <= 0 {
 		interval = 15 * time.Second
@@ -225,10 +299,14 @@ func (o *Observer) RunSnapshotCollector(ctx context.Context, source SnapshotSour
 		timeout = 5 * time.Second
 	}
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			pollCtx, cancel := context.WithTimeout(ctx, timeout)
+			if ctx.Err() != nil {
+				return
+			}
+			pollCtx, cancel := context.WithTimeout(ports.DiagnosticScope(o.DiagnosticContext(ctx)), timeout)
 			start := time.Now()
 			snap, err := source.Snapshot(pollCtx)
 			cancel()
@@ -239,7 +317,11 @@ func (o *Observer) RunSnapshotCollector(ctx context.Context, source SnapshotSour
 				if ctx.Err() == nil {
 					collector.errorsCount.Add(1)
 					collector.succeeded.Store(false)
-					o.logger.Error("monitoring snapshot failed", "error", err.Error())
+					// Retain last-good measurements, but let the failed attempt's
+					// current dependency availability through: a green database
+					// card during an outage is worse than a stale measurement.
+					collector.mergeDependencyHealth(snap)
+					ports.ReportDiagnostic(pollCtx, ports.Diagnostic{Component: "monitoring", Operation: "snapshot"}, err)
 				}
 			} else {
 				snap.TakenAt = time.Now()
@@ -254,6 +336,7 @@ func (o *Observer) RunSnapshotCollector(ctx context.Context, source SnapshotSour
 			}
 		}
 	}()
+	return done
 }
 
 // CurrentSnapshot exposes the last-good snapshot for tests.

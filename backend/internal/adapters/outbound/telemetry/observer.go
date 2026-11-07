@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/adapters/outbound/errorlog"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/vehicle"
 	"github.com/prometheus/client_golang/prometheus"
@@ -31,9 +33,10 @@ var bounds = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 15, 30,
 var operationLabels = []string{"operation", "source", "outcome", "failure", "cache", "status"}
 
 type Observer struct {
-	tracer   trace.Tracer
-	provider *sdktrace.TracerProvider
-	logger   *slog.Logger
+	tracer      trace.Tracer
+	provider    *sdktrace.TracerProvider
+	logger      *slog.Logger
+	diagnostics *errorlog.Reporter
 
 	registry *prometheus.Registry
 
@@ -55,12 +58,13 @@ type Observer struct {
 	schedulerSuccess  *prometheus.GaugeVec
 	schedulerErrors   *prometheus.CounterVec
 
-	retryTickets      *prometheus.CounterVec
-	inventoryCache    *prometheus.CounterVec
-	inventoryQueries  prometheus.Counter
-	postgresPoolConns *prometheus.GaugeVec
-	postgresPoolMax   prometheus.Gauge
-	snapshotCollector *snapshotCollector
+	retryTickets         *prometheus.CounterVec
+	inventoryCache       *prometheus.CounterVec
+	inventoryCacheWrites *prometheus.CounterVec
+	inventoryQueries     prometheus.Counter
+	postgresPoolConns    *prometheus.GaugeVec
+	postgresPoolMax      prometheus.Gauge
+	snapshotCollector    *snapshotCollector
 }
 
 // JSON span output can be redirected to a file alongside the structured event log.
@@ -76,10 +80,11 @@ func New(logs io.Writer, traces io.Writer) (*Observer, error) {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 	o := &Observer{
-		tracer:   provider.Tracer("jamshid"),
-		provider: provider,
-		logger:   slog.New(slog.NewJSONHandler(logs, nil)),
-		registry: registry,
+		tracer:      provider.Tracer("jamshid"),
+		provider:    provider,
+		logger:      slog.New(slog.NewJSONHandler(logs, nil)),
+		diagnostics: errorlog.New(logs),
+		registry:    registry,
 	}
 	o.operations = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "jamshid_operation_duration_seconds",
@@ -152,6 +157,10 @@ func New(logs io.Writer, traces io.Writer) (*Observer, error) {
 		Name: "jamshid_inventory_cache_requests_total",
 		Help: "Inventory cache lookups by outcome: hit, miss, error or bypass.",
 	}, []string{"outcome"})
+	o.inventoryCacheWrites = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "jamshid_inventory_cache_writes_total",
+		Help: "Inventory cache writes by outcome: ok or error (noeviction/write failures stay visible; fallback semantics are unchanged).",
+	}, []string{"outcome"})
 	o.inventoryQueries = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "jamshid_inventory_queries_total",
 		Help: "Inventory searches served from PostgreSQL.",
@@ -171,7 +180,7 @@ func New(logs io.Writer, traces io.Writer) (*Observer, error) {
 		o.workerCapacity, o.workerActive, o.workerAttempts, o.workerDuration,
 		o.workerClaimErrors, o.workerLoopTick, o.workerCompleted,
 		o.schedulerAttempt, o.schedulerSuccess, o.schedulerErrors,
-		o.retryTickets, o.inventoryCache, o.inventoryQueries,
+		o.retryTickets, o.inventoryCache, o.inventoryCacheWrites, o.inventoryQueries,
 		o.postgresPoolConns, o.postgresPoolMax,
 		o.snapshotCollector,
 	)
@@ -192,6 +201,7 @@ func (o *Observer) ObservePostgresPool(acquired, idle, max int32) {
 }
 
 func (o *Observer) Start(ctx context.Context, operation string, platform vehicle.Platform) (context.Context, func(ports.Observation)) {
+	ctx = o.diagnostics.Context(ctx)
 	start := time.Now()
 	ctx, span := o.tracer.Start(ctx, operation, trace.WithAttributes(attribute.String("source", string(platform))))
 	var once sync.Once
@@ -206,6 +216,25 @@ func (o *Observer) Start(ctx context.Context, operation string, platform vehicle
 				}
 			}
 			failure := ports.FailureKind(event.Error)
+			// Only leaf operations emit developer events. Parent aggregation/page
+			// observations would multiply one downstream failure.
+			if event.Error != nil || event.StatusCode >= 400 {
+				if operation == "fetch" || operation == "parser_contract" || strings.HasPrefix(operation, "redis_") {
+					err := event.Error
+					if err == nil {
+						err = errors.New("upstream status")
+					}
+					component := "source"
+					if strings.HasPrefix(operation, "redis_") {
+						component = "redis"
+					}
+					class := failure
+					if class == "none" {
+						class = "http_" + strconv.Itoa(event.StatusCode)
+					}
+					ports.ReportDiagnostic(ctx, ports.Diagnostic{Component: component, Operation: operation, Source: string(platform), ErrorClass: class}, err)
+				}
+			}
 			attrs := []attribute.KeyValue{attribute.String("outcome", outcome), attribute.String("failure", failure), attribute.String("cache", event.Cache), attribute.Int("http.status_code", event.StatusCode), attribute.Int("listings", event.Listings)}
 			span.SetAttributes(attrs...)
 			if event.Error != nil || event.StatusCode >= 400 {
@@ -229,6 +258,7 @@ func (o *Observer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // router.go. Legacy operation classification is preserved unchanged.
 func (o *Observer) HTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(ports.DiagnosticScope(o.diagnostics.Context(r.Context())))
 		capture := &ports.RouteCapture{}
 		r = r.WithContext(ports.WithRouteCapture(r.Context(), capture))
 		start := time.Now()
@@ -256,9 +286,29 @@ func (o *Observer) HTTP(next http.Handler) http.Handler {
 				route = "unmatched"
 			}
 		}
-		o.httpRequests.WithLabelValues(route, r.Method, statusClass(recorder.status)).Inc()
-		o.httpDuration.WithLabelValues(route, r.Method).Observe(time.Since(start).Seconds())
+		if recorder.status >= 500 && !ports.DiagnosticRecorded(ctx) {
+			ports.ReportDiagnostic(ctx, ports.Diagnostic{Component: "http", Operation: normalizeMethod(r.Method) + " " + route, ErrorClass: "http_" + strconv.Itoa(recorder.status)}, errors.New("server response"))
+		}
+		o.httpRequests.WithLabelValues(route, normalizeMethod(r.Method), statusClass(recorder.status)).Inc()
+		o.httpDuration.WithLabelValues(route, normalizeMethod(r.Method)).Observe(time.Since(start).Seconds())
 	})
+}
+
+func (o *Observer) DiagnosticContext(ctx context.Context) context.Context {
+	return o.diagnostics.Context(ctx)
+}
+func (o *Observer) LoggingHeartbeat(ctx context.Context) { o.diagnostics.Heartbeat(ctx) }
+
+// normalizeMethod maps the raw request method to a bounded label set so an
+// arbitrary or malformed method token cannot create unbounded cardinality.
+func normalizeMethod(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodOptions, http.MethodTrace:
+		return method
+	default:
+		return "other"
+	}
 }
 
 func statusClass(code int) string {

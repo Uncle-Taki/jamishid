@@ -27,7 +27,11 @@ func TestQueueSnapshotDerivation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	exec("TRUNCATE crawl_searches,crawl_jobs,crawl_tasks,listings,search_listings,listing_observations,detail_tasks,listing_events,job_details,crawler_retries,coverage_catalogs,egress_proxies CASCADE")
+	// coverage_catalogs is deliberately NOT truncated here: migration 005
+	// seeds the catalog partitions and re-running migrations cannot restore
+	// them (they are already recorded as applied). Truncating them poisoned
+	// later coverage runs in the same database (review finding R9).
+	exec("TRUNCATE crawl_searches,crawl_jobs,crawl_tasks,listings,search_listings,listing_observations,detail_tasks,listing_events,job_details,crawler_retries,egress_proxies CASCADE")
 
 	seed := func(id string) {
 		exec(`INSERT INTO crawl_searches(id,criteria) VALUES($1,'{"query":"x"}')`, id)
@@ -86,6 +90,22 @@ func TestQueueSnapshotDerivation(t *testing.T) {
 	job("j6", "s6", "running")
 	task("j6", "bama", "queued", &past, nil)
 	exec(`INSERT INTO crawler_retries(kind,platform,subject_id,job_id,error_kind,available_at) VALUES('page','bama','j6','j6','http',now()-interval '5 minutes')`)
+
+	// Terminal parents (review finding R3): stored tasks the real Claim can
+	// never take because the parent job left ('queued','running'). They must
+	// report "blocked", never ready or reclaimable. The failed parent's task
+	// carries a much older eligibility time so the ready-age assertion below
+	// would catch any missing parent filter.
+	pastOld := -3600
+	seed("s7")
+	job("j7", "s7", "failed")
+	task("j7", "divar", "queued", &pastOld, nil) // blocked: failed parent
+	seed("s8")
+	job("j8", "s8", "complete")
+	task("j8", "bama", "running", nil, &past) // blocked: expired lease under terminal parent
+	seed("s9")
+	job("j9", "s9", "running")
+	task("j9", "sheypoor", "running", nil, nil) // blocked: leaseless running row is never claimable
 
 	// Detail fixtures.
 	exec(`INSERT INTO listings(platform,id,data,normalized_text,vehicle_type,city,price,mileage,year,body,summary_hash) VALUES
@@ -154,6 +174,9 @@ func TestQueueSnapshotDerivation(t *testing.T) {
 		"page/bama/paused/incremental/none":            1, // j4 queued task under paused parent
 		"page/sheypoor/paused/incremental/none":        1, // j4 delayed task under paused parent
 		"page/bama/ready/incremental/none":             1, // j6 requeued task
+		"page/divar/blocked/incremental/none":          1, // j7 queued under failed parent
+		"page/bama/blocked/incremental/none":           1, // j8 expired lease under complete parent
+		"page/sheypoor/blocked/incremental/none":       1, // j9 leaseless running row
 		// Retry tickets. A delayed task and its ticket are the same pending
 		// work; the fixture proves both sides of the relationship.
 		"retry_page/sheypoor/due/none/none":        1, // j3 ticket
@@ -236,5 +259,150 @@ func TestQueueSnapshotDerivation(t *testing.T) {
 	}
 	if inventoryBy["bama/motorcycle/active/stale"] != 1 {
 		t.Errorf("bama stale = %v", inventoryBy["bama/motorcycle/active/stale"])
+	}
+}
+
+// TestQueueSnapshotMatchesClaimAPI compares the monitoring classification to
+// the real claim API behaviorally (review finding R3): for every combination
+// of parent state, task state, eligibility time and lease, classifying a task
+// as "ready" or "running_expired" must exactly predict whether Claim (or
+// ClaimDetail for the detail queue) takes it. The derivation is validated
+// against the claim path itself, never against a copy of its own expression.
+// Run against a dedicated, disposable database.
+func TestQueueSnapshotMatchesClaimAPI(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx := context.Background()
+	s, err := New(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	exec := func(t *testing.T, sql string, args ...any) {
+		t.Helper()
+		if _, err := s.Pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pageState := func(t *testing.T) string {
+		queues, err := s.QueueCounts(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := ""
+		for _, row := range queues {
+			if row.Queue == "page" {
+				if state != "" && state != row.State {
+					t.Fatalf("multiple page states: %s and %s", state, row.State)
+				}
+				state = row.State
+			}
+		}
+		return state
+	}
+	detailState := func(t *testing.T) string {
+		queues, err := s.QueueCounts(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := ""
+		for _, row := range queues {
+			if row.Queue == "detail" {
+				if state != "" && state != row.State {
+					t.Fatalf("multiple detail states: %s and %s", state, row.State)
+				}
+				state = row.State
+			}
+		}
+		return state
+	}
+
+	type taskCase struct {
+		name        string
+		status      string
+		availOffset *int // seconds from now; nil keeps the column default
+		leaseOffset *int // seconds from now; nil means NULL lease
+	}
+	past, future := -60, 3600
+	pageCases := []taskCase{
+		{"queued ready", "queued", &past, nil},
+		{"retry ready", "retry", &past, nil},
+		{"scheduled", "queued", &future, nil},
+		{"running valid lease", "running", nil, &future},
+		{"running expired lease", "running", nil, &past},
+		{"running leaseless", "running", nil, nil},
+		{"delayed", "delayed", &past, nil},
+		{"task paused", "paused", &past, nil},
+		{"terminal complete", "complete", &past, nil},
+		{"terminal limited", "limited", &past, nil},
+		{"terminal unavailable", "unavailable", &past, nil},
+	}
+	parentStatuses := []string{"queued", "running", "paused", "failed", "complete", "partial"}
+	for _, parent := range parentStatuses {
+		for _, c := range pageCases {
+			t.Run("page/"+parent+"/"+c.name, func(t *testing.T) {
+				exec(t, "TRUNCATE crawl_searches,crawl_jobs,crawl_tasks,detail_tasks,listings,search_listings,listing_observations,listing_events,job_details,crawler_retries,egress_proxies CASCADE")
+				exec(t, `INSERT INTO crawl_searches(id,criteria) VALUES('s','{"query":"x"}')`)
+				exec(t, `INSERT INTO crawl_jobs(id,search_id,mode,status) VALUES('j','s','incremental',$1)`, parent)
+				var available, lease any
+				offset := int64(-60)
+				if c.availOffset != nil {
+					offset = int64(*c.availOffset)
+				}
+				available = time.Now().Add(time.Duration(offset) * time.Second)
+				if c.leaseOffset != nil {
+					lease = time.Now().Add(time.Duration(*c.leaseOffset) * time.Second)
+				}
+				exec(t, `INSERT INTO crawl_tasks(job_id,platform,status,available_at,lease_until) VALUES('j','divar',$1,$2,$3)`, c.status, available, lease)
+				state := pageState(t)
+				monitoringClaimable := state == "ready" || state == "running_expired"
+				_, claimed, err := s.Claim(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if claimed != monitoringClaimable {
+					t.Errorf("parent=%s %s: monitoring state %q (claimable=%v) but Claim returned %v", parent, c.name, state, monitoringClaimable, claimed)
+				}
+			})
+		}
+	}
+
+	detailCases := []taskCase{
+		{"queued ready", "queued", &past, nil},
+		{"retry ready", "retry", &past, nil},
+		{"scheduled", "queued", &future, nil},
+		{"running valid lease", "running", nil, &future},
+		{"running expired lease", "running", nil, &past},
+		{"running leaseless", "running", nil, nil},
+		{"delayed", "delayed", &past, nil},
+		{"terminal complete", "complete", &past, nil},
+		{"terminal failed", "failed", &past, nil},
+	}
+	for _, c := range detailCases {
+		t.Run("detail/"+c.name, func(t *testing.T) {
+			exec(t, "TRUNCATE crawl_searches,crawl_jobs,crawl_tasks,detail_tasks,listings,search_listings,listing_observations,listing_events,job_details,crawler_retries,egress_proxies CASCADE")
+			exec(t, `INSERT INTO listings(platform,id,data,normalized_text,vehicle_type,city,price,mileage,year,body,summary_hash) VALUES('divar','d1','{"platform":"divar","id":"d1"}','t','car','tehran',1,1,1400,'perfect','h1')`)
+			var available, lease any
+			offset := int64(-60)
+			if c.availOffset != nil {
+				offset = int64(*c.availOffset)
+			}
+			available = time.Now().Add(time.Duration(offset) * time.Second)
+			if c.leaseOffset != nil {
+				lease = time.Now().Add(time.Duration(*c.leaseOffset) * time.Second)
+			}
+			exec(t, `INSERT INTO detail_tasks(platform,listing_id,summary_hash,status,purpose,available_at,lease_until) VALUES('divar','d1','h1',$1,'enrich',$2,$3)`, c.status, available, lease)
+			state := detailState(t)
+			monitoringClaimable := state == "ready" || state == "running_expired"
+			_, claimed, err := s.ClaimDetail(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claimed != monitoringClaimable {
+				t.Errorf("%s: monitoring state %q (claimable=%v) but ClaimDetail returned %v", c.name, state, monitoringClaimable, claimed)
+			}
+		})
 	}
 }

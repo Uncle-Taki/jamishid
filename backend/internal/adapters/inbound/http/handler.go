@@ -115,6 +115,9 @@ func (h *AggregationHandler) Crawl(c *gin.Context) {
 	}
 	response := CrawlResponse{Success: err == nil, Data: result.Listings, Sources: result.Sources, Cached: result.Cached}
 	if err != nil {
+		if !errors.Is(err, aggregation.ErrSourcesUnavailable) || !ports.DiagnosticRecorded(c.Request.Context()) {
+			_ = c.Error(err)
+		}
 		response.Error = "Failed to fetch marketplace listings"
 		status := http.StatusInternalServerError
 		if errors.Is(err, aggregation.ErrSourcesUnavailable) {
@@ -144,6 +147,7 @@ func (h *AggregationHandler) Listing(c *gin.Context) {
 	}
 	listing, err := scrapers.FetchListingDetails(c.Request.Context(), platform, u)
 	if err != nil {
+		_ = c.Error(err)
 		c.JSON(502, gin.H{"error": "Listing details are unavailable"})
 		return
 	}
@@ -161,6 +165,7 @@ func (h *AggregationHandler) Categories(c *gin.Context) {
 		}
 		rows, err := h.providerCatalog.Categories(c.Request.Context(), platform, kind, parent)
 		if err != nil {
+			_ = c.Error(err)
 			c.JSON(502, gin.H{"error": "Source catalog is unavailable", "detail": err.Error()})
 			return
 		}
@@ -173,6 +178,7 @@ func (h *AggregationHandler) Categories(c *gin.Context) {
 	}
 	rows, err := h.catalog.Categories(c.Request.Context(), kind, parent)
 	if err != nil {
+		_ = c.Error(err)
 		c.JSON(502, gin.H{"error": "Marketplace catalog is unavailable"})
 		return
 	}

@@ -19,9 +19,14 @@ const prefix = "jamshid:cache:v1:"
 const leaseTTL = 30 * time.Second // Longer than the 15s page and 8s detail deadlines.
 
 type Cache struct {
-	client   *redis.Client
-	ttl      time.Duration
-	observer ports.Observer
+	client *redis.Client
+	// probeClient is a separate, hook-free client used only by the per-poll
+	// write probe. The diagnostic hook would otherwise report a probe OOM as a
+	// synthetic developer-error event on every monitoring poll, polluting the
+	// error groups the panel exists to show.
+	probeClient *redis.Client
+	ttl         time.Duration
+	observer    ports.Observer
 }
 
 func New(rawURL string, ttl time.Duration, observer ports.Observer) (*Cache, error) {
@@ -40,11 +45,19 @@ func New(rawURL string, ttl time.Duration, observer ports.Observer) (*Cache, err
 	if observer == nil {
 		observer = ports.NoopObserver{}
 	}
-	return &Cache{client: redis.NewClient(options), ttl: ttl, observer: observer}, nil
+	client := redis.NewClient(options)
+	client.AddHook(diagnosticHook{})
+	return &Cache{client: client, probeClient: redis.NewClient(options), ttl: ttl, observer: observer}, nil
 }
 
 func (c *Cache) Ping(ctx context.Context) error { return c.client.Ping(ctx).Err() }
-func (c *Cache) Close() error                   { return c.client.Close() }
+func (c *Cache) Close() error {
+	if err := c.client.Close(); err != nil {
+		_ = c.probeClient.Close()
+		return err
+	}
+	return c.probeClient.Close()
+}
 
 func cacheKey(kind, key string) string {
 	sum := sha256.Sum256([]byte(key))
@@ -146,7 +159,7 @@ func load[T any](ctx context.Context, c *Cache, key string, fetch func(context.C
 			defer func() {
 				releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 				defer cancel()
-				_ = releaseScript.Run(releaseCtx, c.client, []string{lock}, token).Err()
+				_ = runScript(releaseCtx, releaseScript, c.client, []string{lock}, token).Err()
 			}()
 			// Close the race between observing a miss and acquiring the lease.
 			if value, ok := read[T](ctx, c, key); ok && !force {
@@ -164,7 +177,7 @@ func load[T any](ctx context.Context, c *Cache, key string, fetch func(context.C
 				return zero, false, err
 			}
 			_, finish := c.observer.Start(ctx, "redis_write", "")
-			published, err := publishScript.Run(ctx, c.client, []string{lock, key}, token, raw, c.ttl.Milliseconds()).Int()
+			published, err := runScript(ctx, publishScript, c.client, []string{lock, key}, token, raw, c.ttl.Milliseconds()).Int()
 			if err == nil && published != 1 {
 				err = errors.New("shared fetch lease expired")
 			}
@@ -193,19 +206,41 @@ func (c *Cache) RefreshDetail(ctx context.Context, key string, fetch func(contex
 
 // All instances use the same durable signing key, so cached continuation tokens
 // remain valid on another instance and after an API restart.
+const cursorSigningKeyName = prefix + "cursor-signing-key"
+
+// CursorSigningKey reuses the shared durable key using a read-first path. A valid
+// existing key is returned with a single read and no write, so a healthy Redis
+// at its memory limit under noeviction does not block startup. Only a genuinely
+// missing key triggers initialization (concurrent-safe: each process proposes a
+// key with SetNX and then reads back the durable winner). A malformed stored key
+// is refused rather than silently rotated, because rotation would invalidate
+// cursors every instance already signed. Errors wrap the cause so an unreachable
+// or unwritable Redis is distinguishable from a clean key lookup.
 func (c *Cache) CursorSigningKey(ctx context.Context) ([]byte, error) {
+	if encoded, err := c.client.Get(ctx, cursorSigningKeyName).Result(); err == nil {
+		return validSigningKey(encoded)
+	} else if !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("read shared cursor signing key: %w", err)
+	}
+
 	var key [32]byte
 	if _, err := rand.Read(key[:]); err != nil {
 		return nil, err
 	}
-	const name = prefix + "cursor-signing-key"
-	if err := c.client.SetNX(ctx, name, hex.EncodeToString(key[:]), 0).Err(); err != nil {
-		return nil, err
+	if err := c.client.SetNX(ctx, cursorSigningKeyName, hex.EncodeToString(key[:]), 0).Err(); err != nil {
+		return nil, fmt.Errorf("initialize shared cursor signing key: %w", err)
 	}
-	encoded, err := c.client.Get(ctx, name).Result()
+	encoded, err := c.client.Get(ctx, cursorSigningKeyName).Result()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read shared cursor signing key after init: %w", err)
 	}
+	return validSigningKey(encoded)
+}
+
+// validSigningKey decodes and length-checks a stored signing key. It does not
+// replace a malformed key: callers treat rejection as a hard failure instead of
+// silently re-keying the whole deployment.
+func validSigningKey(encoded string) ([]byte, error) {
 	decoded, err := hex.DecodeString(encoded)
 	if err != nil || len(decoded) != 32 {
 		return nil, errors.New("invalid shared cursor signing key")

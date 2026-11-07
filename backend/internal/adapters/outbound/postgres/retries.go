@@ -106,18 +106,21 @@ func (s *Store) releaseRetry(ctx context.Context, kind, platform, subject, hash 
 		}
 		requeued = tag.RowsAffected() > 0
 	}
-	_, err = tx.Exec(ctx, `DELETE FROM crawler_retries WHERE kind=$1 AND platform=$2 AND subject_id=$3 AND summary_hash=$4 AND available_at=$5`, kind, platform, subject, hash, due)
+	tag, err := tx.Exec(ctx, `DELETE FROM crawler_retries WHERE kind=$1 AND platform=$2 AND subject_id=$3 AND summary_hash=$4 AND available_at=$5`, kind, platform, subject, hash, due)
 	if err != nil {
 		return err
 	}
+	deleted := tag.RowsAffected()
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
 	// Counted only after the deletion committed. A ticket removed without
 	// requeueing its parent task was stale/orphaned work, not released work.
+	// A repeated concurrent release that deleted no row counts as nothing:
+	// the first attempt already reported the transition.
 	if requeued {
 		s.metrics().RetryReleased(kind)
-	} else {
+	} else if deleted > 0 {
 		s.metrics().RetryDiscarded(kind)
 	}
 	return nil

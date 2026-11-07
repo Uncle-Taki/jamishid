@@ -28,7 +28,17 @@ type DetailService struct {
 	Loop string
 }
 
-func (s *DetailService) WorkOne(ctx context.Context) (bool, error) {
+func (s *DetailService) WorkOne(ctx context.Context) (worked bool, workErr error) {
+	ctx = ports.DiagnosticScope(ctx)
+	defer func() {
+		if !ports.DiagnosticRecorded(ctx) {
+			d := ports.Diagnostic{Component: "worker", Operation: "detail.work"}
+			if errors.Is(workErr, ErrLeaseLost) {
+				d.ErrorClass = "lease_lost"
+			}
+			ports.ReportDiagnostic(ctx, d, workErr)
+		}
+	}()
 	metrics := workerMetrics(s.Metrics)
 	task, ok, err := s.Store.ClaimDetail(ctx)
 	if err != nil {

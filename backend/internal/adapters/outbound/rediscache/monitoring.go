@@ -1,13 +1,28 @@
 package rediscache
 
 import (
+	"bytes"
 	"context"
 	"strconv"
+	"time"
 )
 
-// MonitoringStats is a bounded read-only snapshot of Redis server state and the
-// shared source budget cooldowns. Cooldowns are observed pacing state, never
-// provider quota remaining.
+// writeProbePayload is the canary write size for the per-poll write probe. It
+// is sized near the dominant application writes (about 32 KB page payloads) so
+// the probe starts rejecting at the same memory pressure the application feels,
+// not only when the instance is nearly completely full. A 1-byte probe would
+// report "healthy" while real payload writes are already failing.
+const writeProbePayload = 64 * 1024
+
+// writeProbeKeyPrefix targets the per-poll write probe. A FRESH key is used on
+// purpose: overwriting an existing same-size key would fit even on a full
+// instance (no new allocation), so the probe would never reject. Adding a fresh
+// key forces a real allocation that noeviction rejects at the limit. The short
+// TTL self-cleans the key if the process dies between the probe SET and DEL.
+const writeProbeKeyPrefix = prefix + "monitoring:write-probe:"
+
+// MonitoringStats reads server state and source budget cooldowns and performs
+// a bounded canary write. Cooldowns are pacing state, never provider quota.
 type MonitoringStats struct {
 	Up         bool
 	UsedMemory float64
@@ -16,6 +31,10 @@ type MonitoringStats struct {
 	Misses     float64
 	Evicted    float64
 	Clients    float64
+	// WriteProbeOK marks whether the last per-poll probe write was accepted. A
+	// full instance under noeviction answers INFO and PING while still
+	// rejecting writes, so Up alone cannot expose memory pressure.
+	WriteProbeOK bool
 	// Cooldowns maps each marketplace source to its observed shared budget
 	// cooldown remaining in seconds.
 	Cooldowns map[string]float64
@@ -47,7 +66,26 @@ func (c *Cache) MonitoringStats(ctx context.Context) (MonitoringStats, error) {
 		}
 		stats.Cooldowns[source] = ttl.Seconds()
 	}
+	probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	stats.WriteProbeOK = c.probeWrite(probeCtx) == nil
+	cancel()
 	return stats, nil
+}
+
+// probeWrite performs one bounded write that forces a real allocation (a fresh
+// key of representative payload size), then deletes it. This observes one
+// canary outcome; other payload sizes or concurrent writes can behave differently. It never
+// touches application keys, so it cannot delete or evict signing or
+// coordination state. The probe key self-expires via its TTL.
+func (c *Cache) probeWrite(ctx context.Context) error {
+	name := writeProbeKeyPrefix + strconv.FormatInt(time.Now().UnixMilli(), 10)
+	if err := c.probeClient.Set(ctx, name, bytes.Repeat([]byte{1}, writeProbePayload), 60*time.Second).Err(); err != nil {
+		return err
+	}
+	// Best-effort cleanup; the TTL is the backstop if the process dies in
+	// between. A DEL failure does not mean the write was not accepted.
+	_ = c.probeClient.Del(ctx, name).Err()
+	return nil
 }
 
 // parseInfo converts the Redis INFO text response into a flat numeric map.

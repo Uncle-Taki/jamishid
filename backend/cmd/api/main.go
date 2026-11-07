@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -36,17 +37,31 @@ func main() {
 		defer cancel()
 		_ = observations.Shutdown(ctx)
 	}()
+	loggingCtx, stopLogging := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopLogging()
+	go observations.LoggingHeartbeat(loggingCtx)
+	report := func(ctx context.Context, operation string, err error) {
+		ports.ReportDiagnostic(observations.DiagnosticContext(ctx), ports.Diagnostic{Component: "runtime", Operation: operation}, err)
+	}
 	scrapers.ConfigureObserver(observations)
+	sharedClient := scrapers.NewSharedClient()
 	// Separate internal monitoring listener; it is not routed through public nginx.
+	// One owner shuts it down: this defer, on both the API and worker paths.
 	monitoring := &http.Server{Addr: ":9090", Handler: observations, ReadHeaderTimeout: 5 * time.Second}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = monitoring.Shutdown(ctx)
+	}()
 	go func() {
 		if err := monitoring.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			report(context.Background(), "monitoring.listen", err)
 			log.Printf("Monitoring listener: %v", err)
 		}
 	}()
-	sharedClient := scrapers.NewSharedClient()
 	if path := os.Getenv("CATEGORY_CATALOG_PATH"); path != "" {
 		if err := scrapers.DefaultProviderCatalog().LoadSnapshot(path); err != nil {
+			report(context.Background(), "catalog.load", err)
 			log.Printf("Category snapshot not loaded; using live discovery: %v", err)
 		}
 	}
@@ -68,21 +83,25 @@ func main() {
 	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
 		shared, err := rediscache.New(redisURL, 24*time.Hour, observations)
 		if err != nil {
+			report(context.Background(), "redis.configure", err)
 			log.Fatal(err)
 		}
 		sharedCache = shared
 		defer shared.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(observations.DiagnosticContext(context.Background()), 5*time.Second)
 		if err = shared.Ping(ctx); err != nil {
+			report(ctx, "redis.startup", err)
 			cancel()
 			log.Fatal("Redis cache unavailable at startup")
 		}
 		key, err := shared.CursorSigningKey(ctx)
 		cancel()
 		if err != nil {
+			report(ctx, "cursor_signing_key", err)
 			log.Fatal("Redis cursor signing key unavailable")
 		}
 		if err = scrapers.ConfigureCursorSigningKey(key); err != nil {
+			report(ctx, "cursor.configure", err)
 			log.Fatal(err)
 		}
 		cache = shared
@@ -104,10 +123,11 @@ func main() {
 
 	var store *postgres.Store
 	if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(observations.DiagnosticContext(context.Background()), 30*time.Second)
 		store, err = postgres.New(ctx, databaseURL)
 		cancel()
 		if err != nil {
+			report(ctx, "postgres.startup", err)
 			log.Fatalf("PostgreSQL initialization failed: %v", err)
 		}
 		defer store.Close()
@@ -115,6 +135,7 @@ func main() {
 		if value := os.Getenv("CRAWLER_RETRY_DELAY"); value != "" {
 			delay, parseErr := time.ParseDuration(value)
 			if parseErr != nil || delay < time.Hour || delay > 2*time.Hour {
+				report(context.Background(), "retry.configure", errors.New("invalid retry delay"))
 				log.Fatal("CRAWLER_RETRY_DELAY must be between 1h and 2h")
 			}
 			store.RetryDelay = delay
@@ -125,9 +146,11 @@ func main() {
 	}
 	if os.Getenv("APP_ROLE") == "worker" {
 		if store == nil {
+			report(context.Background(), "worker.configure_database", errors.New("database not configured"))
 			log.Fatal("Worker requires DATABASE_URL")
 		}
 		if inventoryCache == nil {
+			report(context.Background(), "worker.configure_cache", errors.New("cache not configured"))
 			log.Fatal("Worker requires REDIS_URL for shared source budgets and cursor signing")
 		}
 		runWorker(observations, store, aggService)
@@ -135,6 +158,9 @@ func main() {
 	}
 
 	// API role: optionally run the single designated shared snapshot collector.
+	// The collector uses its own small read-only pool (two connections, no
+	// migrations) so monitoring scans never compete with API handlers for
+	// application connections; its lifetime is bound to the collector context.
 	if store != nil && os.Getenv("JAMSHID_MONITORING_COLLECTOR") == "1" {
 		interval := 15 * time.Second
 		if value := os.Getenv("JAMSHID_MONITORING_INTERVAL"); value != "" {
@@ -144,12 +170,40 @@ func main() {
 		}
 		collectorCtx, stopCollector := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stopCollector()
-		source := &snapshotSource{store: store, cache: sharedCache}
-		observations.RunSnapshotCollector(collectorCtx, source, interval, 5*time.Second)
-		log.Printf("Monitoring snapshot collector enabled (interval %s); this process is the designated collector", interval)
+		monitoringStore, err := postgres.NewMonitoring(collectorCtx, os.Getenv("DATABASE_URL"))
+		if err != nil {
+			// Optional monitoring must not take down a working API. A failed
+			// dedicated-pool initialization is logged and the API continues
+			// serving requests without the shared snapshot collector (its
+			// /metrics stays up, serving worker/HTTP signals; the poll-health
+			// series simply stay absent because no collector runs).
+			report(collectorCtx, "monitoring.initialize", err)
+			log.Print("Monitoring collector disabled (dedicated pool init failed)")
+		} else {
+			defer monitoringStore.Close()
+			source := &snapshotSource{
+				store:        monitoringStore,
+				pgTimeout:    defaultPGProbeTimeout,
+				redisTimeout: defaultRedisProbeTimeout,
+			}
+			// Only wrap Redis when configured: a nil *rediscache.Cache would
+			// become a non-nil interface and be probed (nil dereference).
+			if sharedCache != nil {
+				source.cache = sharedCache
+			}
+			// The poll deadline is the sum of the two independent probe
+			// deadlines plus headroom, so each dependency gets its own bounded
+			// budget and total collection stays bounded.
+			collectorDone := observations.RunSnapshotCollector(collectorCtx, source, interval, defaultPGProbeTimeout+defaultRedisProbeTimeout+time.Second)
+			// Cancel and join before the dedicated pool's deferred Close.
+			defer func() { stopCollector(); <-collectorDone }()
+			log.Printf("Monitoring snapshot collector enabled (interval %s, dedicated read-only pool); this process is the designated collector", interval)
+		}
 	}
 	if store != nil {
-		startPoolStats(observations, store)
+		appCtx, stopApp := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stopApp()
+		startPoolStats(appCtx, observations, store)
 	}
 	handler := inboundHttp.NewAggregationHandler(aggService)
 	if store != nil {
@@ -168,6 +222,7 @@ func main() {
 	go func() {
 		log.Println("Starting server on :8080")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			report(context.Background(), "http.listen", err)
 			log.Fatalf("listen: %s\n", err)
 		}
 	}()
@@ -180,6 +235,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
+		report(ctx, "http.shutdown", err)
 		log.Fatal("Server forced to shutdown:", err)
 	}
 	_ = monitoring.Shutdown(ctx)
@@ -196,11 +252,18 @@ func loopCount(name string, fallback int) int {
 	return value
 }
 
-func startPoolStats(observations *telemetry.Observer, store *postgres.Store) {
+// startPoolStats periodically records application pool statistics until ctx
+// is canceled; the goroutine always stops with the process's signal context.
+func startPoolStats(ctx context.Context, observations *telemetry.Observer, store *postgres.Store) {
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 			stats := store.Pool.Stat()
 			observations.ObservePostgresPool(stats.AcquiredConns(), stats.IdleConns(), stats.MaxConns())
 		}
@@ -212,11 +275,13 @@ func runWorker(observations *telemetry.Observer, store *postgres.Store, crawler 
 }) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	ctx = observations.DiagnosticContext(ctx)
 	pageLoops := loopCount("WORKER_PAGE_LOOPS", 3)
 	detailLoops := loopCount("WORKER_DETAIL_LOOPS", 2)
 	observations.SetWorkerCapacity("page", pageLoops)
 	observations.SetWorkerCapacity("detail", detailLoops)
 	if err := store.Schedule(ctx); err != nil {
+		ports.ReportDiagnostic(ctx, ports.Diagnostic{Component: "scheduler", Operation: "initial_schedule"}, err)
 		log.Printf("Initial schedule: %v", err)
 	}
 	var wg sync.WaitGroup
@@ -239,15 +304,19 @@ func runWorker(observations *telemetry.Observer, store *postgres.Store, crawler 
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for {
+			cycleCtx := ports.DiagnosticScope(ctx)
 			observations.LoopTick("maintenance", "1")
-			coverageErr := store.RefreshCoverageCatalog(ctx, scrapers.DefaultProviderCatalog().Categories)
+			coverageErr := store.RefreshCoverageCatalog(cycleCtx, scrapers.DefaultProviderCatalog().Categories)
 			observations.ScheduleAttempt("coverage")(coverageErr)
 			if coverageErr != nil && ctx.Err() == nil {
+				ports.ReportDiagnostic(cycleCtx, ports.Diagnostic{Component: "scheduler", Operation: "coverage"}, coverageErr)
 				log.Printf("Coverage catalog: %v", coverageErr)
 			}
-			verificationErr := store.ScheduleVerification(ctx)
+			cycleCtx = ports.DiagnosticScope(ctx)
+			verificationErr := store.ScheduleVerification(cycleCtx)
 			observations.ScheduleAttempt("verification")(verificationErr)
 			if verificationErr != nil && ctx.Err() == nil {
+				ports.ReportDiagnostic(cycleCtx, ports.Diagnostic{Component: "scheduler", Operation: "verification"}, verificationErr)
 				log.Printf("Listing verification: %v", verificationErr)
 			}
 			select {
@@ -257,9 +326,8 @@ func runWorker(observations *telemetry.Observer, store *postgres.Store, crawler 
 			}
 		}
 	}()
-	startPoolStats(observations, store)
+	startPoolStats(ctx, observations, store)
 	wg.Wait()
-	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = observations.Shutdown(shutdown)
+	// Trace exporter shutdown has one owner: main's defer. The monitoring
+	// listener is also shut down by main's defer on this path.
 }

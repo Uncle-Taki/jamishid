@@ -92,6 +92,7 @@ func TestHTTPRouteNormalization(t *testing.T) {
 		{"GET", "/inventory/divar/1/history"},
 		{"GET", "/inventory/bama/2/history"},
 		{"GET", "/admin/proxies"},
+		{"BREW", "/api/v1/health"}, // arbitrary method token: bounded label
 	}
 	for _, request := range requests {
 		req, err := http.NewRequest(request.method, server.URL+request.path, nil)
@@ -115,14 +116,18 @@ func TestHTTPRouteNormalization(t *testing.T) {
 		`jamshid_http_requests_total{method="DELETE",route="method_not_allowed",status_class="4xx"} 1`,
 		`jamshid_http_requests_total{method="GET",route="/inventory/:platform/:listingID/history",status_class="2xx"} 2`,
 		`jamshid_http_requests_total{method="GET",route="/admin/proxies",status_class="4xx"} 1`,
+		// The arbitrary BREW method is normalized to the bounded "other" bucket;
+		// Gin classifies it as method-not-allowed on a valid route.
+		`jamshid_http_requests_total{method="other",route="method_not_allowed",status_class="4xx"} 1`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("expected series %q in:\n%s", expected, body)
 		}
 	}
-	// 11 requests produce 8 series: the two /jobs/:id requests collapse into
-	// one series, and /jobs/xyz789/sub shares the unmatched bucket with /nope.
-	if got := countSeries(t, body, "jamshid_http_requests_total{"); got != 8 {
+	// 12 requests produce 9 series: the two /jobs/:id requests collapse into
+	// one series, /jobs/xyz789/sub shares the unmatched bucket with /nope, and
+	// the arbitrary BREW method collapses into the bounded "other" bucket.
+	if got := countSeries(t, body, "jamshid_http_requests_total{"); got != 9 {
 		t.Fatalf("route series count %d", got)
 	}
 	if !strings.Contains(body, "jamshid_http_requests_in_flight 0") {

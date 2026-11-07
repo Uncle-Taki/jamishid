@@ -1,12 +1,23 @@
 package http
 
 import (
+	"errors"
 	"github.com/Uncle-Taki/Jame_e_Jahan_Nama/backend/internal/domain/ports"
 	"github.com/gin-gonic/gin"
 )
 
 func SetupRouter(handler *AggregationHandler) *gin.Engine {
-	r := gin.Default()
+	r := gin.New()
+	// Do not serialize raw panic values, headers or request URLs into logs.
+	r.Use(func(c *gin.Context) {
+		defer func() {
+			if recover() != nil {
+				ports.ReportDiagnostic(c.Request.Context(), ports.Diagnostic{Component: "http", Operation: c.Request.Method + " " + c.FullPath(), ErrorClass: "panic"}, errors.New("panic recovered"))
+				c.AbortWithStatus(500)
+			}
+		}()
+		c.Next()
+	})
 
 	// Distinct 405s keep wrong-method requests visible to route metrics.
 	r.HandleMethodNotAllowed = true
@@ -19,6 +30,9 @@ func SetupRouter(handler *AggregationHandler) *gin.Engine {
 			capture.Template = c.FullPath()
 		}
 		c.Next()
+		if c.Writer.Status() >= 500 && len(c.Errors) > 0 {
+			ports.ReportDiagnostic(c.Request.Context(), ports.Diagnostic{Component: "http", Operation: c.Request.Method + " " + c.FullPath()}, c.Errors.Last().Err)
+		}
 	})
 
 	r.Use(func(c *gin.Context) {

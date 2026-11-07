@@ -162,7 +162,7 @@ func TestReleaseOnlyDeletesOwnLease(t *testing.T) {
 	ctx := context.Background()
 	key := cacheKey("page", "owner") + ":lease"
 	server.Set(key, "new-owner")
-	if err := releaseScript.Run(ctx, a.client, []string{key}, "old-owner").Err(); err != nil {
+	if err := runScript(ctx, releaseScript, a.client, []string{key}, "old-owner").Err(); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := server.Get(key); got != "new-owner" {
