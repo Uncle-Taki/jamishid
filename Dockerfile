@@ -1,14 +1,27 @@
-# Frontend build config using Node 22 for Vite
-FROM node:22-alpine
+# Build stage
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
+# Copy go mod and sum files
+COPY go.mod go.sum ./
+RUN go mod download
 
-RUN npm install
-
+# Copy source code
 COPY . .
 
-EXPOSE 3000
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/jamshid-backend ./cmd/api/main.go
 
-CMD ["npm", "run", "dev"]
+# Final stage
+FROM gcr.io/distroless/static-debian11
+
+WORKDIR /
+
+COPY --from=builder /app/bin/jamshid-backend /jamshid-backend
+
+EXPOSE 8080
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/jamshid-backend"]

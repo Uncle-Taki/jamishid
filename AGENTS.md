@@ -4,11 +4,10 @@
 
 Jamshid aggregates and scores vehicle listings from Divar, Bama, and Sheypoor. The Go backend follows hexagonal architecture:
 
-- `backend/cmd/api/main.go`: dependency wiring and HTTP server startup.
-- `backend/internal/domain/vehicle/`: entities, search criteria, and scoring; `domain/ports/`: interfaces.
-- `backend/internal/application/aggregation/`: aggregation workflows.
-- `backend/internal/adapters/`: inbound Gin handlers and outbound scrapers and memory cache.
-- `src/services/apiCrawler.ts`: frontend API client.
+- `cmd/api/main.go`: dependency wiring and HTTP server startup.
+- `internal/domain/vehicle/`: entities, search criteria, and scoring; `domain/ports/`: interfaces.
+- `internal/application/aggregation/`: aggregation workflows.
+- `internal/adapters/`: inbound Gin handlers and outbound scrapers and memory cache.
 
 Keep business rules in the domain, workflows in the application layer, and HTTP and marketplace details in adapters. Tests sit beside implementation files. No dedicated asset directory is currently tracked.
 
@@ -16,13 +15,11 @@ Keep business rules in the domain, workflows in the application layer, and HTTP 
 
 Use Go 1.24 or newer. From the repository root:
 
-- `make -C backend build`: build `backend/bin/jamshid-backend`.
-- `make -C backend run`: start the API on port 8080.
-- `make -C backend test`: run internal tests with race detection and coverage, print coverage, and remove the report.
-- `docker compose up --build backend`: build and run the backend container.
+- `make build`: build `bin/jamshid-backend`.
+- `make run`: start the API on port 8080.
+- `make test`: run internal tests with race detection and coverage, print coverage, and remove the report.
+- `docker build -t jamshid-backend .`: build the backend container.
 - `curl http://localhost:8080/api/v1/health`: check API health.
-
-The frontend Dockerfile expects `package.json` and an npm `dev` script, but package manifests and referenced frontend types are missing. Restore the frontend setup before running the full Compose stack.
 
 ## Coding Style & Naming Conventions
 

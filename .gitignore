@@ -1,0 +1,7 @@
+/bin/
+/tmp/
+/recovery-artifacts/
+/ops/__pycache__/
+*.out
+*.test
+.env
