@@ -332,8 +332,16 @@ func sheypoorPage(doc *html.Node) ([]vehicle.NormalizedVehicleListing, error) {
 			if c.Data == "h2" || c.Data == "h3" {
 				l.Title = textContent(c)
 			}
-			if c.Data == "img" && l.ImageURL == "" {
-				l.ImageURL = attr(c, "src")
+			if c.Data == "img" {
+				if l.ImageURL == "" {
+					l.ImageURL = attr(c, "src")
+				}
+				// Sheypoor moved card titles from heading elements to the
+				// image alt attribute. Keep the accessible alt text as the
+				// listing title when no heading is present.
+				if l.Title == "" {
+					l.Title = strings.TrimSpace(attr(c, "alt"))
+				}
 			}
 			if attr(c, "data-test-id") == "icon-toman" && c.Parent != nil {
 				for p := c.Parent.FirstChild; p != nil; p = p.NextSibling {

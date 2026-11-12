@@ -21,7 +21,7 @@ func TestScraper_PublicSearch(t *testing.T) {
 		if r.Method != "GET" || r.URL.Query().Get("q") != "پژو 206" {
 			t.Errorf("wrong search request: %s", r.URL)
 		}
-		w.Write([]byte(`<a data-test-id="ad-item-real-token" href="/v/car-real-token.html"><h2>پژو 206</h2><div><span>۳۵۰,۰۰۰,۰۰۰</span><span data-test-id="icon-toman"></span></div></a>`))
+		w.Write([]byte(`<a data-test-id="ad-item-real-token" href="/v/car-real-token.html"><img alt="پژو 206" src="https://cdn.sheypoor.com/1.webp"><div><span>۳۵۰,۰۰۰,۰۰۰</span><span data-test-id="icon-toman"></span></div></a>`))
 	}))
 	defer ts.Close()
 	sc := NewScraper(scrapers.NewSharedClient())
