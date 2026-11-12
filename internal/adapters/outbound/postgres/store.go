@@ -151,6 +151,14 @@ func (s *Store) SubmitStatus(ctx context.Context, criteria vehicle.SearchCriteri
 }
 func (s *Store) submit(ctx context.Context, criteria vehicle.SearchCriteria, force, statusOnly bool) (crawljobs.Job, error) {
 	searchID, criteria := crawljobs.SearchIdentity(criteria)
+	if statusOnly {
+		var jobID string
+		err := s.Pool.QueryRow(ctx, `SELECT id FROM crawl_jobs WHERE search_id=$1 AND (status IN ('queued','running','paused') OR (status IN ('complete','partial','failed') AND updated_at>now()-interval '5 minutes')) ORDER BY created_at DESC LIMIT 1`, searchID).Scan(&jobID)
+		if err != nil {
+			return crawljobs.Job{}, err
+		}
+		return s.Status(ctx, jobID)
+	}
 	raw, _ := json.Marshal(criteria)
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
