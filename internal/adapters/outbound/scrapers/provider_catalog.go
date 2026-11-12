@@ -42,6 +42,16 @@ func DefaultProviderCatalog() *ProviderCatalog { return searchCatalog }
 // LoadSnapshot reuses successful discoveries across restarts. An incomplete
 // export is useful, but failed or missing branches must still be fetched live.
 func (c *ProviderCatalog) LoadSnapshot(path string) error {
+	return c.loadSnapshot(path, false)
+}
+
+// LoadSnapshotWithFallback keeps a recent last-known-good snapshot available
+// for the operator UI when live category discovery is temporarily unavailable.
+func (c *ProviderCatalog) LoadSnapshotWithFallback(path string) error {
+	return c.loadSnapshot(path, true)
+}
+
+func (c *ProviderCatalog) loadSnapshot(path string, allowStale bool) error {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -60,6 +70,9 @@ func (c *ProviderCatalog) LoadSnapshot(path string) error {
 	// Keep the last successful snapshot available for the operator UI when a
 	// marketplace is unreachable. It is refreshed from live discovery once the
 	// normal TTL has elapsed; this fallback is intentionally short-lived.
+	if !time.Now().Before(expires) && !allowStale {
+		return fmt.Errorf("category snapshot is stale")
+	}
 	if !time.Now().Before(expires) {
 		expires = time.Now().Add(6 * time.Hour)
 	}

@@ -638,11 +638,11 @@ func sheypoorSearchPage(ctx context.Context, client *SharedClient, base string, 
 	}
 	var response map[string]any
 	if json.Unmarshal(body, &response) != nil {
-		return out, fmt.Errorf("invalid Sheypoor search response")
+		return sheypoorHTMLSearchPage(body, cursor)
 	}
 	ads, ok := response["data"].([]any)
 	if !ok {
-		return out, fmt.Errorf("Sheypoor response has no listing collection")
+		return sheypoorHTMLSearchPage(body, cursor)
 	}
 	out.Parser.Candidates = len(ads)
 	for _, ad := range ads {
@@ -690,5 +690,23 @@ func sheypoorSearchPage(ctx context.Context, client *SharedClient, base string, 
 		state.Filter = filter
 		out.NextCursor = encodeCursor(vehicle.PlatformSheypoor, c, cursor.Page+1, state)
 	}
+	return out, nil
+}
+
+// Sheypoor has intermittently served the browser HTML page at its former JSON
+// search endpoint. Keep the source usable by parsing that page shape when the
+// JSON contract is unavailable.
+func sheypoorHTMLSearchPage(body []byte, cursor pageCursor) (vehicle.ListingPage, error) {
+	out := vehicle.ListingPage{Page: cursor.Page, CategoryMatched: true}
+	doc, err := pageDocument(body)
+	if err != nil {
+		return out, fmt.Errorf("parse Sheypoor search page: %w", err)
+	}
+	out.Listings, err = sheypoorPage(doc)
+	if err != nil {
+		return out, err
+	}
+	out.Parser.Candidates = len(out.Listings)
+	out.Parser.Valid = len(out.Listings)
 	return out, nil
 }

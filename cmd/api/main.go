@@ -62,7 +62,7 @@ func main() {
 		}
 	}()
 	if path := os.Getenv("CATEGORY_CATALOG_PATH"); path != "" {
-		if err := scrapers.DefaultProviderCatalog().LoadSnapshot(path); err != nil {
+		if err := scrapers.DefaultProviderCatalog().LoadSnapshotWithFallback(path); err != nil {
 			report(context.Background(), "catalog.load", err)
 			log.Printf("Category snapshot not loaded; using live discovery: %v", err)
 		}
