@@ -57,6 +57,14 @@ func (h *AggregationHandler) CreateJob(c *gin.Context) {
 	}
 	job, err := submit(ctx, vehicle.SearchCriteria{Query: r.Query, Keywords: r.Keywords, BamaCategory: r.BamaCategory, CitySlug: r.CitySlug, Type: r.Type, Platform: r.Platform}, false)
 	if err != nil {
+		if c.Query("statusOnly") == "1" && errors.Is(err, crawljobs.ErrNotFound) {
+			c.JSON(http.StatusOK, crawljobs.Job{
+				ID: "idle", Status: "idle", Done: true, CrawlDone: true,
+				Criteria: vehicle.SearchCriteria{Query: r.Query, Keywords: r.Keywords, BamaCategory: r.BamaCategory, CitySlug: r.CitySlug, Type: r.Type, Platform: r.Platform},
+				Sources:  []vehicle.SourceStatus{}, Data: []vehicle.NormalizedVehicleListing{},
+			})
+			return
+		}
 		jobError(c, err)
 		return
 	}
