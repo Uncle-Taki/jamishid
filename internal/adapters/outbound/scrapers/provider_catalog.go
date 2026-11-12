@@ -54,8 +54,14 @@ func (c *ProviderCatalog) LoadSnapshot(path string) error {
 		return err
 	}
 	expires := snapshot.UpdatedAt.Add(24 * time.Hour)
-	if snapshot.UpdatedAt.IsZero() || !time.Now().Before(expires) {
+	if snapshot.UpdatedAt.IsZero() {
 		return fmt.Errorf("category snapshot is stale")
+	}
+	// Keep the last successful snapshot available for the operator UI when a
+	// marketplace is unreachable. It is refreshed from live discovery once the
+	// normal TTL has elapsed; this fallback is intentionally short-lived.
+	if !time.Now().Before(expires) {
+		expires = time.Now().Add(6 * time.Hour)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()

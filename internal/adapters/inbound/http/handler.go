@@ -198,7 +198,10 @@ func (h *AggregationHandler) Categories(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "Invalid category request"})
 		return
 	}
-	rows, err := h.catalog.Categories(c.Request.Context(), kind, parent)
+	// The default catalog is served from the shared provider catalog so a
+	// previously captured catalog snapshot can keep the UI usable while a
+	// marketplace is temporarily unreachable.
+	rows, err := h.providerCatalog.Categories(c.Request.Context(), vehicle.PlatformBama, kind, parent)
 	if err != nil {
 		_ = c.Error(err)
 		c.JSON(502, gin.H{"error": "Marketplace catalog is unavailable"})
